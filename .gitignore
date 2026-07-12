@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE (JetBrains already has .idea/.gitignore for some patterns)
+# .idea/ is explicitly tracked in this repo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# uv
+# uv.lock is committed for reproducible builds
