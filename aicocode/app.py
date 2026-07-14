@@ -428,6 +428,49 @@ class CodeApp(App):
             self._select_provider(provider)
 
     """
+      ┌────────────────────────┬───────────────────────────┐                                                                                                                                
+      │ Ctrl+C(流式处理中)       │ 中断当前响应,不退出          │                                                                                                                                 
+      ├────────────────────────┼───────────────────────────┤                                                                                                                                 
+      │ Ctrl+C(空闲)            │ 清理后退出                  │                                                                                                                                 
+      ├────────────────────────┼───────────────────────────┤                                                                                                                                 
+      │ Ctrl+C(清理卡住时再按)    │ 立即强制退出                │                                                                                                                                 
+      └────────────────────────┴───────────────────────────┘
+    """
+    async def action_handle_ctrl_c(self) -> None:
+        if self._streaming:
+            if self._task and not self._task.done():
+                self._task.cancel()
+            self._show_system_message("(response interrupted)")
+            self._finish_streaming()
+            try:
+                inp = self.query_one("#chat-input", ChatInput)
+                inp.disabled = False
+                inp.focus()
+            except Exception:
+                pass
+            return
+
+        if getattr(self, "_exit_requested", False):
+            self.exit()
+            return
+        self._exit_requested = True
+
+        async def _cleanup() -> None:
+            tasks: list[asyncio.Task] = []
+
+            if tasks:
+                await asyncio.wait(tasks, timeout=3.0)
+                for t in tasks:
+                    if not t.done():
+                        t.cancel()
+
+        try:
+            await _cleanup()
+        except Exception:
+            pass
+        self.exit()
+
+    """
         处理 @命令 弹窗 + 选择文件， 收到消息触发
     """
     def on_chat_input_at_file_request(self, event: ChatInput.AtFileRequest) -> None:
@@ -465,7 +508,7 @@ class CodeApp(App):
     async def _dispatch_command_or_input(self, text: str) -> None:
         if self._streaming:
             return
-        self._agent_task = asyncio.create_task(self._send_message(text))
+        self._task = asyncio.create_task(self._send_message(text))
         return
 
     async def app_run(self, conversation: Conversation) -> AsyncIterator[LLMEvent]:
@@ -647,7 +690,7 @@ class CodeApp(App):
     def _finish_streaming(self) -> None:
         self._streaming = False
         self._stop_spinner()
-        self._agent_task = None
+        self._task = None
         if self._spinner_label is not None:
             self._spinner_label.remove()
             self._spinner_label = None
