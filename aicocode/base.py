@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from typing import Any
 
+#------api返回的流式事件------
 
 @dataclass
 class TextDelta:
