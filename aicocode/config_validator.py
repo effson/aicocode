@@ -1,0 +1,112 @@
+"""AicoCode 的配置校验"""
+
+from typing import Literal
+"""
+    模型提供商配置
+"""
+Protocols = Literal["anthropic", "openai", "openai-compatible"]
+VALID_PROTOCOLS = {"anthropic", "openai", "openai-compatible"}
+
+class ConfigError(Exception):
+    pass
+
+def validate_providers(raw_providers: list) -> list[dict]:
+    """校验 providers 列表，返回清洗后的 provider 字典列表。"""
+    if not isinstance(raw_providers, list) or len(raw_providers) == 0:
+        raise ConfigError("At least one provider must be configured")
+
+    providers: list[dict] = []
+    for i, entry in enumerate(raw_providers):
+        if not isinstance(entry, dict):
+            raise ConfigError(f"Provider #{i + 1}: must be a mapping")
+
+        missing = [f for f in ("name", "protocol", "base_url", "model") if f not in entry]
+        if missing:
+            raise ConfigError(f"Provider #{i + 1}: missing fields: {', '.join(missing)}")
+
+        protocol = entry["protocol"]
+        if protocol not in VALID_PROTOCOLS:
+            raise ConfigError(
+                f"Provider #{i + 1}: invalid protocol '{protocol}', "
+                f"must be one of: {', '.join(sorted(VALID_PROTOCOLS))}"
+            )
+
+        # 默认为 0（"未设置"）
+        context_window = entry.get("context_window", 0)
+        if not isinstance(context_window, int) or isinstance(context_window, bool) or context_window < 0:
+            raise ConfigError(
+                f"Provider #{i + 1}: context_window must be a positive integer"
+            )
+
+        thinking = entry.get("thinking", False)
+        if not isinstance(thinking, bool):
+            raise ConfigError(f"Provider #{i + 1}: thinking must be a boolean")
+
+        max_output_tokens = entry.get("max_output_tokens", 0)
+        if not isinstance(max_output_tokens, int) or max_output_tokens < 0:
+            raise ConfigError(
+                f"Provider #{i + 1}: max_output_tokens must be a non-negative integer"
+            )
+
+        providers.append(
+            {
+                "name": entry["name"],
+                "protocol": protocol,
+                "base_url": entry["base_url"],
+                "model": entry["model"],
+                "api_key": entry.get("api_key", ""),
+                "thinking": thinking,
+                "context_window": context_window,
+                "max_output_tokens": max_output_tokens,
+            }
+        )
+
+    return providers
+
+
+"""
+    模型配置
+"""
+DEFAULT_CONTEXT_WINDOW = 200_000
+
+# 内置的"模型名子串 -> context window（最大输入 token 数）"映射表，
+# 是 context window 回退链的第 3 层（见 ProviderConfig.get_context_window）。
+# 模型更新/重命名后可能过时。如果值不准确，在配置中设置 context_window 覆盖（最高优先级）。
+MODEL_CONTEXT_WINDOWS: list[tuple[str, int]] = [
+    ("1m", 1_000_000),       # 也覆盖 "-1m" 后缀（如 claude-...-1m）
+    ("gpt-4.1", 1_000_000),  # GPT-4.1 系列的 window 为 1M
+    ("gpt-4o", 128_000),
+    ("gpt-4-turbo", 128_000),
+    ("o1", 200_000),         # OpenAI 推理模型 o1 / o3 / o4
+    ("o3", 200_000),
+    ("o4", 200_000),
+    ("gpt-3.5", 16_385),
+    ("claude", 200_000),
+]
+
+def lookup_model_context_window(model: str) -> int:
+    """
+        通过子串匹配（第 3 层），返回内置映射表中该模型对应的
+        context window；没有匹配则返回 0。
+    """
+    m = model.lower()
+    for substr, window in MODEL_CONTEXT_WINDOWS:
+        if substr in m:
+            return window
+    return 0
+
+"""
+校验的主入口。校验解析后的原始配置，返回清洗后的字典。
+返回的字典目前包含以下键：
+providers
+"""
+def validate_config(raw: object) -> dict:
+    """
+    目前校验 providers
+    """
+    if not isinstance(raw, dict) or "providers" not in raw:
+        raise ConfigError("Config must contain a 'providers' list")
+
+    return {
+        "providers": validate_providers(raw["providers"]),
+    }
