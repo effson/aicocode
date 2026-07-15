@@ -180,6 +180,7 @@ class ToolRegistry:
         from aicocode.tools.edit_file import EditFile
         from aicocode.tools.write_file import WriteFile
         from aicocode.tools.bash import Bash
+        from aicocode.tools.glob import Glob
 
         file_state_cache = FileStateCache()
         registry = ToolRegistry()
@@ -188,5 +189,6 @@ class ToolRegistry:
         registry.register(EditFile(file_cache=file_cache, file_history=file_history, file_state_cache=file_state_cache))
         registry.register(WriteFile(file_cache=file_cache, file_history=file_history, file_state_cache=file_state_cache))
         registry.register(Bash())
-        
+        registry.register(Glob())
+
         return registry
