@@ -174,23 +174,23 @@ class ToolRegistry:
                 schemas.append(base)
         return schemas
 
-    def create_default_registry(file_cache: FileCache | None = None, file_history: Any = None) -> ToolRegistry:
+def create_default_registry(file_cache: FileCache | None = None, file_history: Any = None) -> ToolRegistry:
 
-        from aicocode.tools.read_file import ReadFile
-        from aicocode.tools.edit_file import EditFile
-        from aicocode.tools.write_file import WriteFile
-        from aicocode.tools.bash import Bash
-        from aicocode.tools.glob import Glob
-        from aicocode.tools.grep import Grep
+    from aicocode.tools.read_file import ReadFile
+    from aicocode.tools.edit_file import EditFile
+    from aicocode.tools.write_file import WriteFile
+    from aicocode.tools.bash import Bash
+    from aicocode.tools.glob import Glob
+    from aicocode.tools.grep import Grep
 
-        file_state_cache = FileStateCache()
-        registry = ToolRegistry()
+    file_state_cache = FileStateCache()
+    registry = ToolRegistry()
 
-        registry.register_tool(ReadFile(file_cache=file_cache, file_state_cache=file_state_cache))
-        registry.register(EditFile(file_cache=file_cache, file_history=file_history, file_state_cache=file_state_cache))
-        registry.register(WriteFile(file_cache=file_cache, file_history=file_history, file_state_cache=file_state_cache))
-        registry.register(Bash())
-        registry.register(Glob())
-        registry.register(Grep())
+    registry.register_tool(ReadFile(file_cache=file_cache, file_state_cache=file_state_cache))
+    registry.register(EditFile(file_cache=file_cache, file_history=file_history, file_state_cache=file_state_cache))
+    registry.register(WriteFile(file_cache=file_cache, file_history=file_history, file_state_cache=file_state_cache))
+    registry.register(Bash())
+    registry.register(Glob())
+    registry.register(Grep())
 
-        return registry
+    return registry
