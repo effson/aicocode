@@ -177,9 +177,11 @@ class ToolRegistry:
     def create_default_registry(file_cache: FileCache | None = None, file_history: Any = None) -> ToolRegistry:
 
         from aicocode.tools.read_file import ReadFile
+        from aicocode.tools.edit_file import EditFile
 
         file_state_cache = FileStateCache()
         registry = ToolRegistry()
 
         registry.register_tool(ReadFile(file_cache=file_cache, file_state_cache=file_state_cache))
+        registry.register(EditFile(file_cache=file_cache, file_history=file_history, file_state_cache=file_state_cache))
         return registry
