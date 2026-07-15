@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
+
+from aicocode.tools.file_state_cache import FileStateCache
 from aicocode.tools.tool_base import Tool
 if TYPE_CHECKING:
     from aicocode.file_cache import FileCache
@@ -173,6 +175,6 @@ class ToolRegistry:
         return schemas
 
     def create_default_registry(file_cache: FileCache | None = None, file_history: Any = None) -> ToolRegistry:
-
+        file_state_cache = FileStateCache()
         registry = ToolRegistry()
         return registry
