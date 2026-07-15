@@ -181,6 +181,7 @@ class ToolRegistry:
         from aicocode.tools.write_file import WriteFile
         from aicocode.tools.bash import Bash
         from aicocode.tools.glob import Glob
+        from aicocode.tools.grep import Grep
 
         file_state_cache = FileStateCache()
         registry = ToolRegistry()
@@ -190,5 +191,6 @@ class ToolRegistry:
         registry.register(WriteFile(file_cache=file_cache, file_history=file_history, file_state_cache=file_state_cache))
         registry.register(Bash())
         registry.register(Glob())
+        registry.register(Grep())
 
         return registry
