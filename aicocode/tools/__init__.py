@@ -175,6 +175,11 @@ class ToolRegistry:
         return schemas
 
     def create_default_registry(file_cache: FileCache | None = None, file_history: Any = None) -> ToolRegistry:
+
+        from aicocode.tools.read_file import ReadFile
+
         file_state_cache = FileStateCache()
         registry = ToolRegistry()
+
+        registry.register_tool(ReadFile(file_cache=file_cache, file_state_cache=file_state_cache))
         return registry
