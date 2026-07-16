@@ -30,7 +30,7 @@ from aicocode.agent_event import (
     LLMResponse,
 )
 
-from aicocode.prompt import build_environment_context
+from aicocode.prompt import build_environment_context, build_system_prompt
 
 from aicocode.base import (
     TextDelta,
@@ -132,10 +132,11 @@ class Agent:
         max_tokens_escalated = False
         output_recoveries = 0
 
-        from aicocode.prompt import SYSTEM_PROMPT
         while True:
             iteration += 1
-
+            
+            system = build_system_prompt()
+            
             deferred_names = self.registry.get_deferred_tool_names()
             if deferred_names:
                 conversation.add_system_reminder(
@@ -149,7 +150,7 @@ class Agent:
 
             collector = StreamCollector()
             executor = StreamingExecutor()
-            llm_stream = self.client.stream(conversation, system=SYSTEM_PROMPT, tools=tools)
+            llm_stream = self.client.stream(conversation, system=system, tools=tools)
             async for event in collector.consume(llm_stream):
                 if isinstance(event, ToolUseEvent):
                     tc = collector.response.tool_calls[-1]
