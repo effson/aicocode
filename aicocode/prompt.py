@@ -32,7 +32,7 @@ class PromptConstructer:
         self._parts: list[PromptPart] = []
 
 
-    def add(self, part: PromptPart) -> PromptBuilder:
+    def add(self, part: PromptPart) -> PromptConstructer:
         self._parts.append(part)
         return self
 

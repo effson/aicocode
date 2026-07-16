@@ -86,7 +86,7 @@ def _exit_code_hint(command: str, exit_code: int) -> str:
         对特殊命令（grep/diff/test等）附加语义说明让 LLM 理解退出码含义。
     """
     cmd_name = _extract_last_command_name(command)
-    hint = _EXIT_CODE_HINTS.get(cmd_name, "") if cmd_name else ""
+    hint = _EXIT_BASH_CODE_HINTS.get(cmd_name, "") if cmd_name else ""
     if hint:
         return f"Exit code {exit_code} ({hint})"
     return f"Exit code {exit_code}"
@@ -108,7 +108,7 @@ class Bash(Tool):
     # OS 级沙箱暂时不实现
 
     async def execute(self, params: Params) -> ToolResult:
-        timeout = min(params.timeout, MAX_TIMEOUT)
+        timeout = min(params.timeout, MAX_BASH_TIMEOUT)
 
         # OS 沙箱暂时不实现
         actual_command = params.command
