@@ -117,3 +117,20 @@ Screen { }
     text-align: right;
     color: $text-muted;
 }
+
+/* --- Tool Call Block --- */
+
+.tool-block {
+    padding: 0 2;
+    width: auto;
+    height: auto;
+    color: $text;
+}
+
+.tool-block-loading {
+    color: $text-muted;
+}
+
+.tool-block-error {
+    color: $error;
+}

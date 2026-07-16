@@ -7,6 +7,7 @@ import time as _time
 from pathlib import Path
 from typing import Any, AsyncIterator
 
+from pydantic import ValidationError
 from rich.markup import escape
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -18,8 +19,15 @@ from rich.text import Text as RichText
 from textual.theme import Theme
 
 from aicocode.conversation import (
-    ToolUseBlock
+    ToolUseBlock,
+    ToolResultBlock,
 )
+
+from aicocode.file_cache import FileCache
+from aicocode.tools import ToolRegistry, create_default_registry
+from aicocode.tools.impl.tool_search import ToolSearchTool
+from aicocode.tools.tool_base import ToolResult
+
 import aicocode.prompt
 from aicocode.llm_generated_event import (
     LLMEvent,
@@ -33,8 +41,9 @@ from aicocode.llm_generated_event import (
     UsageEvent,
     ErrorEvent,
     StreamCollector,
-    ThinkingBlock
-    # StreamingExecutor,
+    ThinkingBlock,
+    StreamingExecutor,
+    _ToolExecResult,
 )
 
 from aicocode.llm_client import (
@@ -48,6 +57,7 @@ from aicocode.llm_client import (
 from aicocode.config import ProviderConfig
 from aicocode.conversation import Conversation, Message
 from aicocode.commands.popup_completion import CompletionPopup
+from aicocode.prompt import build_environment_context
 
 import re
 
@@ -318,6 +328,155 @@ def _to_past_tense(verb: str) -> str:
         return stem + "ed"
     return verb + "ed"
 
+COLLAPSIBLE_TOOLS = {"ReadFile", "Glob", "Grep", "ToolSearch"}
+
+class ToolGroupSummary(Static, can_focus=True):
+
+
+    def __init__(self, count: int, total_elapsed: float, **kwargs: Any) -> None:
+        label = f"● Done ({count} tool uses · {total_elapsed:.1f}s)  (ctrl+o to expand)"
+        super().__init__(label, **kwargs)
+        self._count = count
+        self._total = total_elapsed
+        self._expanded = False
+
+    def _refresh_display(self) -> None:
+        if self._expanded:
+            self.update(f"▼ Done ({self._count} tool uses · {self._total:.1f}s)")
+        else:
+            self.update(
+                f"● Done ({self._count} tool uses · {self._total:.1f}s)"
+                "  (ctrl+o to expand)"
+            )
+
+    def toggle(self) -> None:
+        self._expanded = not self._expanded
+        self._refresh_display()
+
+
+    def on_click(self) -> None:
+        self.toggle()
+
+def _tool_title(tool_name: str, arguments: dict[str, Any]) -> str:
+    if tool_name == "ReadFile":
+        path = os.path.basename(arguments.get("file_path", ""))
+        return f"Read {path}" if path else "Read"
+    if tool_name == "WriteFile":
+        path = os.path.basename(arguments.get("file_path", ""))
+        content = arguments.get("content", "")
+        lines = content.count("\n") + 1 if content else 0
+        return f"Write {path} ({lines} lines)" if path else "Write"
+    if tool_name == "EditFile":
+        path = os.path.basename(arguments.get("file_path", ""))
+        return f"Edit {path}" if path else "Edit"
+    if tool_name == "Bash":
+        cmd = arguments.get("command", "")
+        short = cmd[:50] + "…" if len(cmd) > 50 else cmd
+        return f"Bash: {short}" if short else "Bash"
+    if tool_name == "Glob":
+        return f"Glob: {arguments.get('pattern', '')}"
+    if tool_name == "Grep":
+        return f"Grep: {arguments.get('pattern', '')}"
+    return tool_name
+
+def _format_detail(tool_name: str, arguments: dict[str, Any], output: str) -> str:
+    parts: list[str] = []
+
+    if tool_name == "Bash":
+        parts.append(f"  IN   {arguments.get('command', '')}")
+        parts.append("")
+        for line in output.splitlines():
+            parts.append(f"  OUT  {line}")
+    elif tool_name == "EditFile":
+        # EditFile 的 output 是 build_diff() 生成的带行号 diff 文本：
+        # "+ " 开头绿色、"- " 开头红色，其余（上下文行/摘要行）走 dim。
+        # 转义 Rich markup 特殊字符，避免代码里的方括号被当成标签解析。
+        for line in output.splitlines()[:MAX_TRUNCATED_LINES]:
+            escaped = escape(line)
+            if line.startswith("+ "):
+                parts.append(f"  [green]{escaped}[/]")
+            elif line.startswith("- "):
+                parts.append(f"  [red]{escaped}[/]")
+            else:
+                parts.append(f"  [dim]{escaped}[/]")
+        total = output.count("\n") + 1
+        if total > MAX_TRUNCATED_LINES:
+            parts.append(f"  [dim]… ({total - MAX_TRUNCATED_LINES} more lines)[/]")
+    elif tool_name in ("ReadFile", "WriteFile"):
+        parts.append(f"  {arguments.get('file_path', '')}")
+        parts.append("")
+        for line in output.splitlines()[:MAX_TRUNCATED_LINES]:
+            parts.append(f"  {line}")
+        total = output.count("\n") + 1
+        if total > MAX_TRUNCATED_LINES:
+            parts.append(f"  … ({total - MAX_TRUNCATED_LINES} more lines)")
+    else:
+        for line in output.splitlines()[:MAX_TRUNCATED_LINES]:
+            parts.append(f"  {line}")
+        total = output.count("\n") + 1
+        if total > MAX_TRUNCATED_LINES:
+            parts.append(f"  … ({total - MAX_TRUNCATED_LINES} more lines)")
+
+    return "\n".join(parts)
+
+class ToolCallBlock(Static, can_focus=True):
+
+    def __init__(self, tool_name: str, arguments: dict[str, Any], **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.tool_name = tool_name
+        self._arguments = arguments
+        self._title = _tool_title(tool_name, arguments)
+        self._full_output = ""
+        self._is_error = False
+        self._elapsed = 0.0
+        self._collapsed = True
+        self._loading = True
+        self._render_loading()
+
+    def _render_loading(self) -> None:
+        self.update(f"  ● {self._title} …")
+        self.add_class("tool-block-loading")
+
+    def set_result(self, output: str, is_error: bool, elapsed: float) -> None:
+        self._full_output = output
+        self._is_error = is_error
+        self._elapsed = elapsed
+        self._loading = False
+        self.remove_class("tool-block-loading")
+        if is_error:
+            self.add_class("tool-block-error")
+        # EditFile 的 diff 是最高频需要的信息，默认直接展开，不用等用户点
+        # 或按 ctrl+o；其余工具仍然默认折叠，避免刷屏。
+        if self.tool_name == "EditFile" and not is_error:
+            self._collapsed = False
+            self._render_expanded()
+        else:
+            self._collapsed = True
+            self._render_collapsed()
+
+    def _render_collapsed(self) -> None:
+        if self._is_error:
+            self.update(f"  ✗ {self._title} ({self._elapsed:.1f}s)")
+        else:
+            self.update(f"  ✓ {self._title} ({self._elapsed:.1f}s)")
+
+    def _render_expanded(self) -> None:
+        if self._is_error:
+            header = f"  ✗ {self._title} ({self._elapsed:.1f}s)"
+        else:
+            header = f"  ✓ {self._title} ({self._elapsed:.1f}s)"
+        detail = _format_detail(self.tool_name, self._arguments, self._full_output)
+        self.update(f"{header}\n{detail}")
+
+    def on_click(self) -> None:
+        if self._loading:
+            return
+        self._collapsed = not self._collapsed
+        if self._collapsed:
+            self._render_collapsed()
+        else:
+            self._render_expanded()
+
 class CodeApp(App):
     CSS_PATH = "styles.tcss"
     TITLE = "AicoCode"
@@ -349,6 +508,9 @@ class CodeApp(App):
         self._spinner_label: Static | None = None
         self.total_input_tokens: int = 0
         self.total_output_tokens: int = 0
+        self.file_cache = FileCache()
+        self.registry: ToolRegistry = create_default_registry(file_cache=self.file_cache)
+        self.work_dir: str = ""
 
     @staticmethod
     def _make_banner(model: str = "", work_dir: str = "") -> RichText:
@@ -398,6 +560,13 @@ class CodeApp(App):
         except AuthenticationError as e:
             self._show_error(str(e))
             return
+
+        self.work_dir = os.getcwd()
+        home = Path.home()
+
+        self.registry.register_tool(
+            ToolSearchTool(self.registry, protocol=provider.protocol)
+        )
 
         self.query_one("#model-label", Static).update(provider.model)
         work_dir = os.getcwd()
@@ -499,10 +668,19 @@ class CodeApp(App):
         input_widget.focus()
 
     """
-        用户按 Enter 输入后的处理逻辑
+        用户按 Enter 输入后的处理逻辑，包括终端agent正在处理任务时，用户输入内容的处理逻辑
     """
     async def on_chat_input_submitted(self, event: ChatInput.Submitted) -> None:
         text = event.text.strip()
+        if self._streaming and not text.startswith("/"):
+            if self._task and not self._task.done():
+                self._task.cancel()
+                try:
+                    await self._task
+                except (asyncio.CancelledError, Exception):
+                    pass
+            self._finish_streaming()
+            self._show_system_message("(response interrupted)")
         await self._dispatch_command_or_input(text)
 
     async def _dispatch_command_or_input(self, text: str) -> None:
@@ -511,7 +689,50 @@ class CodeApp(App):
         self._task = asyncio.create_task(self._send_message(text))
         return
 
+    async def _execute_single_tool_direct(
+        self, tc: ToolCallComplete
+    ) -> _ToolExecResult:
+        tool = self.registry.get_tool(tc.tool_name)
+        start = _time.monotonic()
+
+        if tool is None:
+            return _ToolExecResult(
+                tool_id=tc.tool_id,
+                tool_name=tc.tool_name,
+                result=ToolResult(output=f"Error: unknown tool '{tc.tool_name}'", is_error=True),
+                elapsed=_time.monotonic() - start,
+                is_unknown=True,
+            )
+
+        if not self.registry.tool_is_enabled(tc.tool_name):
+            return _ToolExecResult(
+                tool_id=tc.tool_id,
+                tool_name=tc.tool_name,
+                result=ToolResult(output=f"Error: tool '{tc.tool_name}' is disabled", is_error=True),
+                elapsed=_time.monotonic() - start,
+                is_unknown=False,
+            )
+
+        try:
+            params = tool.params_model.model_validate(tc.arguments)
+            result = await tool.execute(params)
+        except ValidationError as e:
+            result = ToolResult(output=f"Parameter validation error: {e}", is_error=True)
+        except Exception as e:
+            result = ToolResult(output=f"Tool execution error: {e}", is_error=True)
+
+        return _ToolExecResult(
+            tool_id=tc.tool_id,
+            tool_name=tc.tool_name,
+            result=result,
+            elapsed=_time.monotonic() - start,
+            is_unknown=False,
+        )
+
     async def app_run(self, conversation: Conversation) -> AsyncIterator[LLMEvent]:
+        env_context = build_environment_context(self.work_dir)
+        conversation.inject_environment_context(env_context)
+
         iteration = 0
         consecutive_unknown = 0
         max_tokens_escalated = False
@@ -521,11 +742,26 @@ class CodeApp(App):
         while True:
             iteration += 1
 
+            deferred_names = self.registry.get_deferred_tool_names()
+            if deferred_names:
+                conversation.add_system_reminder(
+                    "The following deferred tools are available via ToolSearch. "
+                    "Their schemas are NOT loaded - use ToolSearch with "
+                    'query "select:<name>[,<name>...]" to load tool schemas before calling them:\n'
+                    + "\n".join(deferred_names)
+                )
+
+            tools = self.registry.get_all_schemas(self._selected_provider.protocol)
+
             collector = StreamCollector()
-            llm_stream = self.client.stream(conversation, system=SYSTEM_PROMPT)
+            executor = StreamingExecutor()
+            llm_stream = self.client.stream(conversation, system=SYSTEM_PROMPT, tools=tools)
             async for event in collector.consume(llm_stream):
                 if isinstance(event, ToolUseEvent):
-                    pass
+                    tc = collector.response.tool_calls[-1]
+                    # 需要交互式权限确认的工具延迟到流结束后顺序执行
+                    tool = self.registry.get_tool(tc.tool_name)
+                    executor.submit(self._execute_single_tool_direct(tc))
                 yield event
 
             response = collector.response
@@ -549,6 +785,53 @@ class CodeApp(App):
 
                 yield LoopComplete(total_turns=iteration)
                 break
+
+            tool_uses = [
+                ToolUseBlock(
+                    tool_use_id=tc.tool_id,
+                    tool_name=tc.tool_name,
+                    arguments=tc.arguments,
+                )
+                for tc in response.tool_calls
+            ]
+
+            conversation.add_assistant_message(
+                response.text, tool_uses, thinking_blocks=conv_thinking
+            )
+
+            # 收集流式执行器中已提交的工具结果（工具在 LLM 流式输出期间已开始执行）
+            tool_results: list[ToolResultBlock] = []
+            streaming_results: list[_ToolExecResult] = await executor.collect_results()
+            
+            for tool_exec_res in streaming_results:
+                if tool_exec_res.is_unknown:
+                    consecutive_unknown += 1
+                else:
+                    consecutive_unknown = 0
+
+                tool_results.append(
+                    ToolResultBlock(
+                        tool_use_id=tool_exec_res.tool_id,
+                        content=tool_exec_res.result.output,
+                        is_error=tool_exec_res.result.is_error,
+                    )
+                )
+                yield ToolResultEvent(
+                    tool_id=tool_exec_res.tool_id,
+                    tool_name=tool_exec_res.tool_name,
+                    output=tool_exec_res.result.output,
+                    is_error=tool_exec_res.result.is_error,
+                    elapsed=tool_exec_res.elapsed,
+                )
+
+            if consecutive_unknown >= 3:
+                yield ErrorEvent(
+                    message="Agent terminated: too many consecutive unknown tool calls"
+                )
+                break
+
+            conversation.add_tool_results_message(tool_results)
+            yield TurnComplete(turn=iteration)
 
     async def _send_message(self, text: str, is_notification: bool = False) -> None:
         self._streaming = True
@@ -586,7 +869,7 @@ class CodeApp(App):
         await ai_row.mount(streaming_label)
 
         accumulated_text = ""
-        # tool_blocks: dict[str, ToolCallBlock] = {}
+        tool_blocks: dict[str, ToolCallBlock] = {}
 
         # 在聊天区底部启动持续旋转的加载动画
         self._thinking_start = _time.monotonic()
@@ -622,9 +905,52 @@ class CodeApp(App):
                     self.call_after_refresh(chat.scroll_end, animate=False)
 
                 elif isinstance(event, ToolUseEvent):
-                    pass
+                    if accumulated_text:
+                        if streaming_label is not None:
+                            await streaming_label.remove()
+                        from rich.text import Text as RichText
+                        prefix = Static(RichText("●  ", style="bold color(99)"), classes="message")
+                        await ai_row.mount(prefix)
+                        md = Markdown(accumulated_text, classes="message ai-message")
+                        await ai_row.mount(md)
+                        streaming_label = None
+                        accumulated_text = ""
+                    elif streaming_label is not None:
+                        await streaming_label.remove()
+                        streaming_label = None
+
+                    block = ToolCallBlock(
+                        event.tool_name, event.arguments, classes="tool-block"
+                    )
+
+                    await ai_row.mount(block)
+                    tool_blocks[event.tool_id] = block
+                    self.call_after_refresh(chat.scroll_end, animate=False)
+                elif isinstance(event, ToolResultEvent):
+                    block = tool_blocks.get(event.tool_id)
+                    if block:
+                        block.set_result(event.output, event.is_error, event.elapsed)
+                    self.call_after_refresh(chat.scroll_end, animate=False)
 
                 elif isinstance(event, TurnComplete):
+                    collapsible = [
+                        (tid, blk) for tid, blk in tool_blocks.items()
+                        if isinstance(blk, ToolCallBlock)
+                           and blk.tool_name in COLLAPSIBLE_TOOLS
+                           and not blk._loading
+                    ]
+
+                    if len(collapsible) >= 2:
+                        total_elapsed = sum(b._elapsed for _, b in collapsible)
+                        summary = ToolGroupSummary(
+                            len(collapsible), total_elapsed,
+                            classes="tool-block tool-group-summary",
+                        )
+                        for _, blk in collapsible:
+                            blk.display = False
+                        await ai_row.mount(summary)
+
+                    tool_blocks.clear()
                     ai_row = Vertical(classes="ai-row")
                     await chat.mount(ai_row)
                     streaming_label = Static("", classes="message ai-message")

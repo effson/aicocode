@@ -1,12 +1,8 @@
 """内置 system prompt 与启动 ASCII banner。"""
 
 from __future__ import annotations
-
-ASCII_BANNER = r"""
-   _\_/_
-  [ o.o ]
-  |__v__|
-"""
+from datetime import datetime
+import platform
 
 SYSTEM_PROMPT = """\
 You are AicoCode, a concise command-line AI assistant running in the user's terminal.
@@ -26,3 +22,17 @@ def render_banner(version: str, cwd: str) -> str:
         "Ready. Type a message and press Enter to send (Alt+Enter for a new line, /exit to quit).",
     ]
     return "\n".join(lines)
+
+def build_environment_context(
+    work_dir: str,
+) -> str:
+    parts = [
+        f"Current working directory: {work_dir}",
+        f"Operating system: {platform.system()} {platform.release()}",
+        f"Current time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+    ]
+
+    # active_skills 不再注入 env context —— Skill 内容作为普通消息注入一次到对话历史，
+    # 随对话自然推远，auto-compact 时会被摘要。
+
+    return "\n".join(parts)

@@ -38,6 +38,7 @@ class Conversation:
         维护完整对话历史（user / assistant 交替）。
     """
     messages: list[Message] = field(default_factory=list)
+    env_injected: bool = field(default=False, init=False)
 
     def add_user_message(self, content: str) -> None:
         """追加用户消息。"""
@@ -75,6 +76,11 @@ class Conversation:
                 tool_results=tool_results
             )
         )
+
+    def inject_environment_context(self, context: str) -> None:
+        if not self.env_injected:
+            self.messages.insert(0, Message(role="user", content=context))
+            self.env_injected = True
 
     def fetch_messages(self) -> list[Message]:
         return list(self.messages)
