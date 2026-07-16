@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from aicocode.tools.tool_base import Tool, ToolResult
+from pydantic import BaseModel, Field
 
 if TYPE_CHECKING:
     from aicocode.file_cache import FileCache

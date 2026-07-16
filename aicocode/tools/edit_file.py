@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from aicocode.tools.tool_base import Tool, ToolResult
 from aicocode.tools.edit_diff import build_diff
+from pydantic import BaseModel, Field
 
 if TYPE_CHECKING:
     from aicocode.file_cache import FileCache

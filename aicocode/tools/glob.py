@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from aicocode.tools.tool_base import Tool, ToolResult, SKIP_DIRS
+from pydantic import BaseModel, Field
 
 class Params(BaseModel):
     pattern: str = Field(description="Glob pattern to match (e.g. '**/*.py')")

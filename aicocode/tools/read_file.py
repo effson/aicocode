@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, Field
 
-from mewcode.tools.base import Tool, ToolResult
+from aicocode.tools.tool_base import Tool, ToolResult
 
 if TYPE_CHECKING:
     from mewcode.cache import FileCache

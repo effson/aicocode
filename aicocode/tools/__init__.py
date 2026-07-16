@@ -187,10 +187,10 @@ def create_default_registry(file_cache: FileCache | None = None, file_history: A
     registry = ToolRegistry()
 
     registry.register_tool(ReadFile(file_cache=file_cache, file_state_cache=file_state_cache))
-    registry.register(EditFile(file_cache=file_cache, file_history=file_history, file_state_cache=file_state_cache))
-    registry.register(WriteFile(file_cache=file_cache, file_history=file_history, file_state_cache=file_state_cache))
-    registry.register(Bash())
-    registry.register(Glob())
-    registry.register(Grep())
+    registry.register_tool(EditFile(file_cache=file_cache, file_history=file_history, file_state_cache=file_state_cache))
+    registry.register_tool(WriteFile(file_cache=file_cache, file_history=file_history, file_state_cache=file_state_cache))
+    registry.register_tool(Bash())
+    registry.register_tool(Glob())
+    registry.register_tool(Grep())
 
     return registry
