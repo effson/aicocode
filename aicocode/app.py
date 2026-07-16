@@ -508,8 +508,6 @@ class CodeApp(App):
         self._spinner_idx: int = 0
         self._spinner_timer = None
         self._spinner_label: Static | None = None
-        self.total_input_tokens: int = 0
-        self.total_output_tokens: int = 0
         self.file_cache = FileCache()
         self.registry: ToolRegistry = create_default_registry(file_cache=self.file_cache)
         self.work_dir: str = ""
