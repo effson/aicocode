@@ -29,8 +29,8 @@ from aicocode.tools.impl.tool_search import ToolSearchTool
 from aicocode.tools.tool_base import ToolResult
 
 import aicocode.prompt
-from aicocode.llm_generated_event import (
-    LLMEvent,
+from aicocode.agent_event import (
+    AgentEvent,
     StreamText,
     ThinkingText,
     RetryEvent,
@@ -58,6 +58,7 @@ from aicocode.config import ProviderConfig
 from aicocode.conversation import Conversation, Message
 from aicocode.commands.popup_completion import CompletionPopup
 from aicocode.prompt import build_environment_context
+from aicocode.agent import Agent
 
 import re
 
@@ -497,9 +498,10 @@ class CodeApp(App):
         super().__init__(driver_class=driver_class)
         self.providers = providers
         self.client: LLMClient | None = None
+        self.agent: Agent | None = None
         self.conversation = Conversation()
         self._selected_provider: ProviderConfig | None = None
-        self._task: asyncio.Task[None] | None = None
+        self._agent_task: asyncio.Task[None] | None = None
         self._streaming = False
         self._thinking_start: float = 0.0
         self._thinking_verb: str = ""
@@ -511,6 +513,7 @@ class CodeApp(App):
         self.file_cache = FileCache()
         self.registry: ToolRegistry = create_default_registry(file_cache=self.file_cache)
         self.work_dir: str = ""
+        self._instructions_content: str = ""
 
     @staticmethod
     def _make_banner(model: str = "", work_dir: str = "") -> RichText:
@@ -561,11 +564,20 @@ class CodeApp(App):
             self._show_error(str(e))
             return
 
-        self.work_dir = os.getcwd()
+        work_dir = os.getcwd()
         home = Path.home()
 
         self.registry.register_tool(
             ToolSearchTool(self.registry, protocol=provider.protocol)
+        )
+
+        self.agent = Agent(
+            client=self.client,
+            registry=self.registry,
+            protocol=provider.protocol,
+            work_dir=work_dir,
+            context_window=provider.get_context_window(),
+            instructions_content=self._instructions_content,
         )
 
         self.query_one("#model-label", Static).update(provider.model)
@@ -607,8 +619,8 @@ class CodeApp(App):
     """
     async def action_handle_ctrl_c(self) -> None:
         if self._streaming:
-            if self._task and not self._task.done():
-                self._task.cancel()
+            if self._agent_task and not self._agent_task.done():
+                self._agent_task.cancel()
             self._show_system_message("(response interrupted)")
             self._finish_streaming()
             try:
@@ -673,10 +685,10 @@ class CodeApp(App):
     async def on_chat_input_submitted(self, event: ChatInput.Submitted) -> None:
         text = event.text.strip()
         if self._streaming and not text.startswith("/"):
-            if self._task and not self._task.done():
-                self._task.cancel()
+            if self._agent_task and not self._agent_task.done():
+                self._agent_task.cancel()
                 try:
-                    await self._task
+                    await self._agent_task
                 except (asyncio.CancelledError, Exception):
                     pass
             self._finish_streaming()
@@ -686,152 +698,8 @@ class CodeApp(App):
     async def _dispatch_command_or_input(self, text: str) -> None:
         if self._streaming:
             return
-        self._task = asyncio.create_task(self._send_message(text))
+        self._agent_task = asyncio.create_task(self._send_message(text))
         return
-
-    async def _execute_single_tool_direct(
-        self, tc: ToolCallComplete
-    ) -> _ToolExecResult:
-        tool = self.registry.get_tool(tc.tool_name)
-        start = _time.monotonic()
-
-        if tool is None:
-            return _ToolExecResult(
-                tool_id=tc.tool_id,
-                tool_name=tc.tool_name,
-                result=ToolResult(output=f"Error: unknown tool '{tc.tool_name}'", is_error=True),
-                elapsed=_time.monotonic() - start,
-                is_unknown=True,
-            )
-
-        if not self.registry.tool_is_enabled(tc.tool_name):
-            return _ToolExecResult(
-                tool_id=tc.tool_id,
-                tool_name=tc.tool_name,
-                result=ToolResult(output=f"Error: tool '{tc.tool_name}' is disabled", is_error=True),
-                elapsed=_time.monotonic() - start,
-                is_unknown=False,
-            )
-
-        try:
-            params = tool.params_model.model_validate(tc.arguments)
-            result = await tool.execute(params)
-        except ValidationError as e:
-            result = ToolResult(output=f"Parameter validation error: {e}", is_error=True)
-        except Exception as e:
-            result = ToolResult(output=f"Tool execution error: {e}", is_error=True)
-
-        return _ToolExecResult(
-            tool_id=tc.tool_id,
-            tool_name=tc.tool_name,
-            result=result,
-            elapsed=_time.monotonic() - start,
-            is_unknown=False,
-        )
-
-    async def app_run(self, conversation: Conversation) -> AsyncIterator[LLMEvent]:
-        env_context = build_environment_context(self.work_dir)
-        conversation.inject_environment_context(env_context)
-
-        iteration = 0
-        consecutive_unknown = 0
-        max_tokens_escalated = False
-        output_recoveries = 0
-
-        from aicocode.prompt import SYSTEM_PROMPT
-        while True:
-            iteration += 1
-
-            deferred_names = self.registry.get_deferred_tool_names()
-            if deferred_names:
-                conversation.add_system_reminder(
-                    "The following deferred tools are available via ToolSearch. "
-                    "Their schemas are NOT loaded - use ToolSearch with "
-                    'query "select:<name>[,<name>...]" to load tool schemas before calling them:\n'
-                    + "\n".join(deferred_names)
-                )
-
-            tools = self.registry.get_all_schemas(self._selected_provider.protocol)
-
-            collector = StreamCollector()
-            executor = StreamingExecutor()
-            llm_stream = self.client.stream(conversation, system=SYSTEM_PROMPT, tools=tools)
-            async for event in collector.consume(llm_stream):
-                if isinstance(event, ToolUseEvent):
-                    tc = collector.response.tool_calls[-1]
-                    # 需要交互式权限确认的工具延迟到流结束后顺序执行
-                    tool = self.registry.get_tool(tc.tool_name)
-                    executor.submit(self._execute_single_tool_direct(tc))
-                yield event
-
-            response = collector.response
-
-            self.total_input_tokens += response.input_tokens
-            self.total_output_tokens += response.output_tokens
-            yield UsageEvent(
-                input_tokens=self.total_input_tokens,
-                output_tokens=self.total_output_tokens,
-            )
-
-            conv_thinking = [
-                ThinkingBlock(thinking=tb.thinking, signature=tb.signature)
-                for tb in response.thinking_blocks
-            ]
-
-            if not response.tool_calls:
-                conversation.add_assistant_message(
-                    response.text, thinking_blocks=conv_thinking
-                )
-
-                yield LoopComplete(total_turns=iteration)
-                break
-
-            tool_uses = [
-                ToolUseBlock(
-                    tool_use_id=tc.tool_id,
-                    tool_name=tc.tool_name,
-                    arguments=tc.arguments,
-                )
-                for tc in response.tool_calls
-            ]
-
-            conversation.add_assistant_message(
-                response.text, tool_uses, thinking_blocks=conv_thinking
-            )
-
-            # 收集流式执行器中已提交的工具结果（工具在 LLM 流式输出期间已开始执行）
-            tool_results: list[ToolResultBlock] = []
-            streaming_results: list[_ToolExecResult] = await executor.collect_results()
-            
-            for tool_exec_res in streaming_results:
-                if tool_exec_res.is_unknown:
-                    consecutive_unknown += 1
-                else:
-                    consecutive_unknown = 0
-
-                tool_results.append(
-                    ToolResultBlock(
-                        tool_use_id=tool_exec_res.tool_id,
-                        content=tool_exec_res.result.output,
-                        is_error=tool_exec_res.result.is_error,
-                    )
-                )
-                yield ToolResultEvent(
-                    tool_id=tool_exec_res.tool_id,
-                    tool_name=tool_exec_res.tool_name,
-                    output=tool_exec_res.result.output,
-                    is_error=tool_exec_res.result.is_error,
-                    elapsed=tool_exec_res.elapsed,
-                )
-
-            if consecutive_unknown >= 3:
-                yield ErrorEvent(
-                    message="Agent terminated: too many consecutive unknown tool calls"
-                )
-                break
-
-            conversation.add_tool_results_message(tool_results)
-            yield TurnComplete(turn=iteration)
 
     async def _send_message(self, text: str, is_notification: bool = False) -> None:
         self._streaming = True
@@ -887,7 +755,7 @@ class CodeApp(App):
         await asyncio.sleep(0)
 
         try:
-            async for event in self.app_run(self.conversation):
+            async for event in self.agent.run(self.conversation):
                 if isinstance(event, ThinkingText):
                     self.call_after_refresh(chat.scroll_end, animate=False)
 
@@ -1016,7 +884,7 @@ class CodeApp(App):
     def _finish_streaming(self) -> None:
         self._streaming = False
         self._stop_spinner()
-        self._task = None
+        self._agent_task = None
         if self._spinner_label is not None:
             self._spinner_label.remove()
             self._spinner_label = None

@@ -80,7 +80,7 @@ class UsageEvent:
 class ErrorEvent:
     message: str
 
-LLMEvent = (
+AgentEvent = (
     StreamText
     | ThinkingText
     | RetryEvent
@@ -98,7 +98,7 @@ class StreamCollector:
 
     async def consume(
         self, stream: AsyncIterator[StreamEvent]
-    ) -> AsyncIterator[LLMEvent]:
+    ) -> AsyncIterator[AgentEvent]:
         async for event in stream:
             if isinstance(event, TextDelta):
                 self.response.text += event.text
