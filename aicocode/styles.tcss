@@ -134,3 +134,15 @@ Screen { }
 .tool-block-error {
     color: $error;
 }
+
+/* --- Inline Permission Widget --- */
+
+#perm-inline {
+    height: auto;
+    padding: 0 0;
+    margin: 0 0;
+}
+
+#perm-content {
+    padding: 0 0;
+}
