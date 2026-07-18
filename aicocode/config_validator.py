@@ -7,6 +7,13 @@ from typing import Literal
 Protocols = Literal["anthropic", "openai", "openai-compatible"]
 VALID_PROTOCOLS = {"anthropic", "openai", "openai-compatible"}
 
+VALID_PERMISSION_MODES = {
+    "default",
+    "acceptEdits",
+    "plan",
+    "bypassPermissions",
+}
+
 class ConfigError(Exception):
     pass
 
@@ -63,6 +70,38 @@ def validate_providers(raw_providers: list) -> list[dict]:
 
     return providers
 
+def validate_permission_mode(mode: str) -> str:
+    """校验 permission_mode 取值。"""
+    if mode not in VALID_PERMISSION_MODES:
+        raise ConfigError(
+            f"Invalid permission_mode '{mode}', "
+            f"must be one of: {', '.join(sorted(VALID_PERMISSION_MODES))}"
+        )
+    return mode
+
+def validate_sandbox(raw_sb: dict | None) -> dict:
+    """校验 sandbox 配置段，返回清洗后的配置字典。"""
+    defaults = {
+        "enabled": False,
+        "auto_allow": False,
+        "network_enabled": False,
+    }
+
+    if raw_sb is None:
+        return defaults
+
+    if not isinstance(raw_sb, dict):
+        raise ConfigError("'sandbox' must be a mapping")
+
+    result = dict(defaults)
+    for key in ("enabled", "auto_allow", "network_enabled"):
+        if key in raw_sb:
+            val = raw_sb[key]
+            if not isinstance(val, bool):
+                raise ConfigError(f"'sandbox.{key}' must be a boolean")
+            result[key] = val
+
+    return result
 
 """
     模型配置
@@ -109,4 +148,6 @@ def validate_config(raw: object) -> dict:
 
     return {
         "providers": validate_providers(raw["providers"]),
+        "permission_mode": validate_permission_mode(raw.get("permission_mode", "default")),
+        "sandbox": validate_sandbox(raw.get("sandbox")),
     }

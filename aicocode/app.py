@@ -44,6 +44,8 @@ from aicocode.agent_event import (
     ThinkingBlock,
     StreamingExecutor,
     _ToolExecResult,
+    PermissionResponse,
+    PermissionRequest,
 )
 
 from aicocode.llm_client import (
@@ -54,11 +56,19 @@ from aicocode.llm_client import (
     resolve_context_window,
 )
 
-from aicocode.config import ProviderConfig
+from aicocode.config import ProviderConfig, SandboxAppConfig
 from aicocode.conversation import Conversation, Message
 from aicocode.commands.popup_completion import CompletionPopup
 from aicocode.prompt import build_environment_context
 from aicocode.agent import Agent
+from aicocode.permission_dialog import InlinePermissionWidget
+from aicocode.Permissions import (
+    PermissionMode,
+    PermissionValidator,
+    DangerousCommandDetector,
+    PathSandbox,
+    RuleEngine,
+)
 
 import re
 
@@ -318,6 +328,20 @@ THINKING_VERBS = [
 
 SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
+_MODE_CYCLE = [
+    PermissionMode.DEFAULT,
+    PermissionMode.ACCEPT_EDITS,
+    PermissionMode.PLAN,
+    PermissionMode.BYPASS,
+]
+
+_MODE_COLORS = {
+    PermissionMode.DEFAULT: "dim",
+    PermissionMode.ACCEPT_EDITS: "green",
+    PermissionMode.PLAN: "yellow",
+    PermissionMode.BYPASS: "red",
+}
+
 def _to_past_tense(verb: str) -> str:
     """把现在进行时动词转换为过去式。"""
     if verb.endswith("ing"):
@@ -493,10 +517,13 @@ class CodeApp(App):
     def __init__(
         self,
         providers: list[ProviderConfig],
+        permission_mode: PermissionMode = PermissionMode.DEFAULT,
         driver_class: type | None = None,
+        sandbox_config: Any = None,
     ) -> None:
         super().__init__(driver_class=driver_class)
         self.providers = providers
+        self._initial_permission_mode = permission_mode
         self.client: LLMClient | None = None
         self.agent: Agent | None = None
         self.conversation = Conversation()
@@ -512,6 +539,8 @@ class CodeApp(App):
         self.registry: ToolRegistry = create_default_registry(file_cache=self.file_cache)
         self.work_dir: str = ""
         self._instructions_content: str = ""
+        self._sandbox_cfg: SandboxAppConfig = sandbox_config or SandboxAppConfig()
+        self._has_exited_plan_mode: bool = False
 
     @staticmethod
     def _make_banner(model: str = "", work_dir: str = "") -> RichText:
@@ -565,6 +594,22 @@ class CodeApp(App):
         work_dir = os.getcwd()
         home = Path.home()
 
+        sandbox_auto_allow = (
+            self._sandbox_cfg.enabled and self._sandbox_cfg.auto_allow
+        )
+
+        permissionvalidator = PermissionValidator(
+            danger_command_detector=DangerousCommandDetector(),
+            path_sandbox=PathSandbox(work_dir),
+            rule_engine=RuleEngine(
+                user_rules_path=home / ".aicocode" / "permissions.yaml",
+                project_rules_path=Path(work_dir) / ".aicocode" / "permissions.yaml",
+                local_rules_path=Path(work_dir) / ".aicocode" / "permissions.local.yaml",
+            ),
+            permission_mode=self._initial_permission_mode,
+            os_sandbox_enabled=sandbox_auto_allow,
+        )
+        
         self.registry.register_tool(
             ToolSearchTool(self.registry, protocol=provider.protocol)
         )
@@ -574,6 +619,7 @@ class CodeApp(App):
             registry=self.registry,
             protocol=provider.protocol,
             work_dir=work_dir,
+            permission_validator=permissionvalidator,
             context_window=provider.get_context_window(),
             instructions_content=self._instructions_content,
         )
@@ -583,6 +629,8 @@ class CodeApp(App):
         self.query_one("#title-bar", Static).update(
             self._make_banner(provider.model, work_dir)
         )
+        
+        self._update_mode_label()
 
         select = self.query("#provider-select")
         if select:
@@ -648,6 +696,42 @@ class CodeApp(App):
         except Exception:
             pass
         self.exit()
+
+    _MODE_DISPLAY = {
+        PermissionMode.DEFAULT: "default",
+        PermissionMode.ACCEPT_EDITS: "accept-edits",
+        PermissionMode.PLAN: "plan",
+        PermissionMode.BYPASS: "YOLO",
+    }
+
+    def action_cycle_mode(self) -> None:
+        if self.agent is None:
+            return
+        current = self.agent.permission_mode
+        try:
+            idx = _MODE_CYCLE.index(current)
+        except ValueError:
+            idx = 0
+        next_mode = _MODE_CYCLE[(idx + 1) % len(_MODE_CYCLE)]
+        self.agent.set_permission_mode(next_mode)
+        self._update_mode_label()
+
+    def _update_mode_label(self) -> None:
+        if self.agent:
+            perm = self.agent.permission_mode
+            display = self._MODE_DISPLAY.get(perm, perm.value)
+            color = _MODE_COLORS.get(perm, "dim")
+            label = self.query_one("#mode-label", Static)
+            if perm == PermissionMode.DEFAULT:
+                label.update(f"[{color}]{display}[/{color}]")
+            else:
+                label.update(f"[{color}]{display}[/{color}]  (shift+tab to cycle)")
+        try:
+            model_label = self.query_one("#model-label", Static)
+            model_text = self._selected_provider.model if self._selected_provider else ""
+            model_label.update(model_text)
+        except Exception:
+            pass
 
     """
         处理 @命令 弹窗 + 选择文件， 收到消息触发
@@ -792,6 +876,10 @@ class CodeApp(App):
                     await ai_row.mount(block)
                     tool_blocks[event.tool_id] = block
                     self.call_after_refresh(chat.scroll_end, animate=False)
+
+                elif isinstance(event, PermissionRequest):
+                    await self._handle_permission_request(event)
+
                 elif isinstance(event, ToolResultEvent):
                     block = tool_blocks.get(event.tool_id)
                     if block:
@@ -913,3 +1001,36 @@ class CodeApp(App):
                     self.query_one("#chat-area", VerticalScroll).scroll_end(animate=False)
                 except Exception:
                     pass
+
+    async def _handle_permission_request(self, request: PermissionRequest) -> None:
+
+        chat = self.query_one("#chat-area", VerticalScroll)
+        widget = InlinePermissionWidget(request.tool_name, request.description)
+        self._pending_perm_request = request
+        await chat.mount(widget)
+        self.call_after_refresh(chat.scroll_end, animate=False)
+        # 权限提示弹窗期间禁用输入框
+        try:
+            self.query_one("#chat-input").disabled = True
+        except Exception:
+            pass
+
+    def on_inline_permission_widget_responded(
+        self, event: "InlinePermissionWidget.Responded"
+    ) -> None:
+        req = getattr(self, "_pending_perm_request", None)
+        if req is not None:
+            req.future.set_result(event.response)
+            self._pending_perm_request = None
+        # 从聊天区移除权限弹窗组件
+        try:
+            widget = self.query_one("#perm-inline", InlinePermissionWidget)
+            widget.remove()
+        except Exception:
+            pass
+        # 重新启用输入框
+        try:
+            self.query_one("#chat-input").disabled = False
+            self.query_one("#chat-input").focus()
+        except Exception:
+            pass

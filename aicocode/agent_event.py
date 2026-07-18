@@ -4,6 +4,7 @@ llm 流式输出事件
 import asyncio
 from dataclasses import dataclass, field
 from typing import AsyncIterator, Any
+from enum import Enum
 
 from aicocode.base import (
     TextDelta,
@@ -80,6 +81,17 @@ class UsageEvent:
 class ErrorEvent:
     message: str
 
+class PermissionResponse(Enum):
+    ALLOW = "allow"
+    DENY = "deny"
+    ALLOW_ALWAYS = "allow_always"
+
+@dataclass
+class PermissionRequest:
+    tool_name: str
+    description: str
+    future: asyncio.Future[PermissionResponse]
+
 AgentEvent = (
     StreamText
     | ThinkingText
@@ -90,6 +102,7 @@ AgentEvent = (
     | LoopComplete
     | UsageEvent
     | ErrorEvent
+    | PermissionRequest
 )
 
 class StreamCollector:

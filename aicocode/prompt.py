@@ -212,6 +212,101 @@ def build_environment_part(work_dir: str, env: EnvCtx | None = None) -> PromptPa
         lines.append(f" - Model: {env.model}")
     return PromptPart(name="Environment", priority=70, content="\n".join(lines))
 
+"""
+    PLAN mode提示语
+"""
+_PLAN_MODE_FULL_REMINDER = """\
+Plan mode is active. The user indicated that they do not want you to execute yet -- you MUST NOT make any edits (with the exception of the plan file mentioned below), run any non-readonly tools (including changing configs or making commits), or otherwise make any changes to the system. This supercedes any other instructions you have received.
+
+## Plan File Info:
+{plan_file_info}
+You should build your plan incrementally by writing to or editing this file. NOTE that this is the only file you are allowed to edit - other than this you are only allowed to take READ-ONLY actions.
+
+## Plan Workflow
+
+### Phase 1: Initial Understanding
+Goal: Gain a comprehensive understanding of the user's request by reading through code and asking them questions.
+
+1. Focus on understanding the user's request and the code associated with their request. Actively search for existing functions, utilities, and patterns that can be reused.
+2. Use the Agent tool with subagent_type="explore" to explore the codebase. You can launch up to 3 explore agents IN PARALLEL.
+
+### Phase 2: Design
+Goal: Design an implementation approach.
+Call the Agent tool with subagent_type="plan" to design the implementation based on the user's intent and your exploration results.
+
+### Phase 3: Review
+Goal: Review the plan(s) and ensure alignment with the user's intentions.
+1. Read the critical files identified by agents to deepen your understanding
+2. Ensure that the plans align with the user's original request
+
+### Phase 4: Final Plan
+Goal: Write your final plan to the plan file (the only file you can edit).
+- Begin with a Context section explaining why this change is being made
+- Include only your recommended approach
+- Include the paths of critical files to be modified
+- Include a verification section describing how to test the changes
+
+### Phase 5: Call ExitPlanMode
+At the very end of your turn, call ExitPlanMode to indicate that you are done planning."""
+
+_PLAN_MODE_SPARSE_REMINDER = (
+    "Plan mode still active (see full instructions earlier in conversation). "
+    "Read-only except plan file ({plan_file_path}). Follow 5-phase workflow."
+)
+
+_REMINDER_INTERVAL = 5
+
+_PLAN_MODE_EXIT_REMINDER = """\
+## Exited Plan Mode
+
+You have exited plan mode. You can now make edits, run tools, and take actions.{extra}"""
+
+_PLAN_MODE_REENTRY_REMINDER = (
+    "You have re-entered plan mode. Your previous plan file is at {plan_file_path}. "
+    "Review it and continue from where you left off. You can update, refine, "
+    "or restart the plan as needed. Follow the same 5-phase workflow as before."
+)
+
+def build_plan_mode_exit_reminder(plan_file_path: str, plan_file_exists: bool) -> str:
+    """退出 Plan Mode 时注入的提示，告知模型可以执行操作了。"""
+    extra = ""
+    if plan_file_exists:
+        extra = " The plan file is located at " + plan_file_path + " if you need to reference it."
+    return _PLAN_MODE_EXIT_REMINDER.format(extra=extra)
+
+
+def build_plan_mode_reentry_reminder(plan_file_path: str, plan_file_exists: bool) -> str:
+    """重新进入 Plan Mode 时注入的提示（仅在已有 plan 文件时返回非空）。"""
+    if not plan_file_exists:
+        return ""
+    return _PLAN_MODE_REENTRY_REMINDER.format(plan_file_path=plan_file_path)
+
+
+def build_plan_mode_reminder(
+    plan_file_path: str, plan_file_exists: bool, iteration: int
+) -> str:
+    if plan_file_exists:
+        plan_file_info = (
+            f"Plan file: {plan_file_path}\n"
+            f"A plan file already exists at {plan_file_path}. "
+            "You can read it and make incremental edits using the EditFile tool."
+        )
+    else:
+        plan_file_info = (
+            f"Plan file: {plan_file_path}\n"
+            f"No plan file exists yet. You should create your plan at {plan_file_path} "
+            "using the WriteFile tool."
+        )
+
+    if iteration == 1:
+        return _PLAN_MODE_FULL_REMINDER.format(plan_file_info=plan_file_info)
+
+    attachment_index = (iteration - 1) // _REMINDER_INTERVAL
+    if attachment_index % _REMINDER_INTERVAL == 0:
+        return _PLAN_MODE_FULL_REMINDER.format(plan_file_info=plan_file_info)
+
+    return _PLAN_MODE_SPARSE_REMINDER.format(plan_file_path=plan_file_path)
+
 def build_system_prompt(
     custom_instructions: str = "",
     work_dir: str = ".",

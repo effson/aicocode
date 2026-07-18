@@ -90,11 +90,21 @@ class ProviderConfig:
         return 8192
 
 @dataclass
+class SandboxAppConfig:
+    """沙箱相关的配置项。"""
+    enabled: bool = False         # 是否启用 OS 沙箱
+    auto_allow: bool = False      # 是否自动放行命令（沙箱兜底）
+    network_enabled: bool = False  # 沙箱内是否允许网络访问
+
+
+@dataclass
 class AppConfig:
     """
         应用配置：providers 列表 + 初始选定供应商名。
     """
     providers: list[ProviderConfig]
+    permission_mode: str = "default"
+    sandbox: SandboxAppConfig = field(default_factory=SandboxAppConfig)
 
 def _load_config_yaml(path: Path) -> AppConfig:
     try:
@@ -118,14 +128,31 @@ def _load_config_yaml(path: Path) -> AppConfig:
         for p in validated_config["providers"]
     ]
 
+    sb = validated_config["sandbox"]
+    sandbox_cfg = SandboxAppConfig(
+        enabled=sb["enabled"],
+        auto_allow=sb["auto_allow"],
+        network_enabled=sb["network_enabled"],
+    )
+
     return AppConfig(
         providers=providers,
+        permission_mode=validated_config["permission_mode"],
+        sandbox=sandbox_cfg,
     )
 
 def _merge_existing_config(base: AppConfig, override: AppConfig) -> AppConfig:
     if override.providers:
         base.providers = override.providers
+    if override.permission_mode != "default":
+        base.permission_mode = override.permission_mode
 
+    if override.sandbox.enabled:
+        base.sandbox.enabled = True
+    if override.sandbox.auto_allow:
+        base.sandbox.auto_allow = True
+    if override.sandbox.network_enabled:
+        base.sandbox.network_enabled = True
     return base
 
 
