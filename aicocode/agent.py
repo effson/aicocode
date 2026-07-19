@@ -35,6 +35,7 @@ from aicocode.agent_event import (
     LLMResponse,
     PermissionResponse,
     PermissionRequest,
+    AskUserRequest,
 )
 
 from aicocode.prompt import build_environment_context, build_system_prompt, build_plan_mode_reminder
@@ -58,6 +59,7 @@ from aicocode.tools.tool_base import (
 from aicocode.conversation import Conversation, ToolUseBlock, ToolResultBlock
 
 from aicocode.tools import ToolRegistry
+from aicocode.tools.ask_user import AskUserTool
 
 from .config_validator import Protocols
 
@@ -217,6 +219,36 @@ class Agent:
                     # 同时加入会话级放行集合，本轮立即生效无需磁盘读取
                     self.permission_validator.add_session_allow(tc.tool_name, content)
 
+        # AskUserQuestion：交互由 Agent 事件流接管。yield AskUserRequest 让 UI
+        # 弹窗，await future 拿到回答后用 format_result 汇总，不走 tool.execute。
+        if isinstance(tool, AskUserTool):
+            try:
+                au_params = tool.params_model.model_validate(tc.arguments)
+            except ValidationError as e:
+                result = ToolResult(
+                    output=f"Parameter validation error: {e}", is_error=True
+                )
+                elapsed = time.monotonic() - start
+                yield result, elapsed, is_unknown
+                return
+            loop = asyncio.get_running_loop()
+            future: asyncio.Future[dict[str, str]] = loop.create_future()
+            yield AskUserRequest(
+                questions=[q.model_dump() for q in au_params.questions],
+                future=future,
+            )
+            try:
+                answers = await asyncio.wait_for(future, timeout=300)
+            except asyncio.TimeoutError:
+                result = ToolResult(
+                    output="User did not respond within 5 minutes", is_error=True
+                )
+            else:
+                result = AskUserTool.format_result(au_params, answers)
+            elapsed = time.monotonic() - start
+            yield result, elapsed, is_unknown
+            return
+
         try:
             params = tool.params_model.model_validate(tc.arguments)
             result = await tool.execute(params)
@@ -253,7 +285,7 @@ class Agent:
         _NOUNS = ["sketch", "draft", "spark", "bloom", "trail", "ridge", "creek", "grove",
                   "cliff", "cloud", "field", "forge", "frost", "haven", "pearl", "stone",
                   "storm", "river", "tower", "delta", "flame", "orbit", "pulse", "shore"]
-        plans_dir = Path(self.work_dir) / ".mewcode" / "plans"
+        plans_dir = Path(self.work_dir) / ".aicocode" / "plans"
         plans_dir.mkdir(parents=True, exist_ok=True)
         ts = datetime.datetime.now().strftime("%m%d-%H%M")
         slug = f"{random.choice(_ADJECTIVES)}-{random.choice(_NOUNS)}-{ts}"
@@ -309,7 +341,9 @@ class Agent:
                     if tool and self.permission_validator:
                         permission_res: PermissionRes = self.permission_validator.check(tool, tc.arguments)
                         needs_query = permission_res.permission == "query"
-                    if needs_query:
+                    # 需要交互式确认（权限 query）或需要 UI 弹窗（AskUserQuestion）
+                    # 的工具，延迟到流结束后顺序执行，以便 yield 交互事件给 UI。
+                    if needs_query or isinstance(tool, AskUserTool):
                         deferred_tool_calls.append(tc)
                     else:
                         executor.submit(self._execute_single_tool_direct(tc))
@@ -383,7 +417,7 @@ class Agent:
                 is_unknown = False
 
                 async for item in self._execute_tool(tc):
-                    if isinstance(item, PermissionRequest):
+                    if isinstance(item, (PermissionRequest, AskUserRequest)):
                         yield item
                     else:
                         result, elapsed, is_unknown = item

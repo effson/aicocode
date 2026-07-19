@@ -1,4 +1,8 @@
-Screen { }
+Screen {
+    /* Screen 默认 overflow-y: auto，内容溢出时会整体滚动。
+       锁死滚动，保证只有 #chat-area 内部滚动，title/input 区固定不动。 */
+    overflow: hidden;
+}
 
 #title-bar {
     dock: top;
@@ -34,7 +38,8 @@ Screen { }
 
 #chat-area {
     height: 1fr;
-    min-height: 18;
+    /* 不设 min-height：固定值会在小窗口下把布局撑出 Screen 高度，
+       导致整个 app 视口滚动。1fr 已保证它填满 title 与 input 之间的空间。 */
     padding: 0 1;
 }
 
@@ -144,5 +149,78 @@ Screen { }
 }
 
 #perm-content {
+    padding: 0 0;
+}
+
+/* --- Plan Approval Dialog --- */
+
+PlanApprovalDialog {
+    align: center middle;
+}
+
+#plan-dialog {
+    width: 64;
+    height: auto;
+    padding: 1 2;
+    background: $surface;
+    border: solid $warning;
+}
+
+#plan-title {
+    text-style: bold;
+    text-align: center;
+    padding: 0 0 1 0;
+}
+
+#plan-dialog Button {
+    width: 100%;
+    margin: 0 0 1 0;
+}
+
+/* --- AskUser Dialog --- */
+
+AskUserDialog {
+    align: center middle;
+}
+
+#askuser-dialog {
+    width: 64;
+    height: auto;
+    max-height: 20;
+    padding: 1 2;
+    background: $surface;
+    border: solid $accent;
+}
+
+#askuser-title {
+    text-style: bold;
+    text-align: center;
+    padding: 0 0 1 0;
+}
+
+#askuser-options {
+    height: auto;
+    max-height: 12;
+}
+
+/* --- Inline Plan Widget --- */
+
+#plan-inline {
+    height: auto;
+    padding: 0 0;
+}
+
+#plan-content {
+    padding: 0 0;
+}
+
+/* --- Inline AskUser Widget --- */
+
+#askuser-inline {
+    height: auto;
+    padding: 0 0;
+}
+
+#askuser-content {
     padding: 0 0;
 }

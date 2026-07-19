@@ -46,6 +46,7 @@ from aicocode.agent_event import (
     _ToolExecResult,
     PermissionResponse,
     PermissionRequest,
+    AskUserRequest,
 )
 
 from aicocode.llm_client import (
@@ -62,6 +63,11 @@ from aicocode.commands.popup_completion import CompletionPopup
 from aicocode.prompt import build_environment_context
 from aicocode.agent import Agent
 from aicocode.permission_dialog import InlinePermissionWidget
+from aicocode.tools.ask_user import AskUserTool
+from aicocode.tools.exit_plan_mode import ExitPlanModeTool
+from aicocode.askuser_dialog import InlineAskUserWidget
+from aicocode.plan_dialog import InlinePlanWidget, PlanChoice
+from aicocode.prompt import build_plan_mode_exit_reminder
 from aicocode.Permissions import (
     PermissionMode,
     PermissionValidator,
@@ -614,6 +620,10 @@ class CodeApp(App):
             ToolSearchTool(self.registry, protocol=provider.protocol)
         )
 
+        self.registry.register_tool(AskUserTool())
+        self._exit_plan_tool = ExitPlanModeTool()
+        self.registry.register_tool(self._exit_plan_tool)
+
         self.agent = Agent(
             client=self.client,
             registry=self.registry,
@@ -623,6 +633,9 @@ class CodeApp(App):
             context_window=provider.get_context_window(),
             instructions_content=self._instructions_content,
         )
+
+        self._exit_plan_tool._is_plan_mode = lambda: self.agent.in_plan_mode
+        self._exit_plan_tool._plan_file_exists = lambda: self.agent._get_plan_path().exists()
 
         self.query_one("#model-label", Static).update(provider.model)
         work_dir = os.getcwd()
@@ -643,7 +656,10 @@ class CodeApp(App):
         chat_input.focus()
 
     def _show_error(self, text: str) -> None:
-        chat = self.query_one("#chat-area", VerticalScroll)
+        try:
+            chat = self.query_one("#chat-area", VerticalScroll)
+        except Exception:
+            return  # app 关闭/DOM 已拆时静默
         error_widget = Static(f"✖ {text}", classes="message error-message")
         chat.mount(error_widget)
         self.call_after_refresh(chat.scroll_end, animate=False)
@@ -667,6 +683,8 @@ class CodeApp(App):
         if self._streaming:
             if self._agent_task and not self._agent_task.done():
                 self._agent_task.cancel()
+            self._cleanup_pending_askuser()
+            self._cleanup_pending_perm()
             self._show_system_message("(response interrupted)")
             self._finish_streaming()
             try:
@@ -880,6 +898,9 @@ class CodeApp(App):
                 elif isinstance(event, PermissionRequest):
                     await self._handle_permission_request(event)
 
+                elif isinstance(event, AskUserRequest):
+                    await self._handle_askuser(event)
+
                 elif isinstance(event, ToolResultEvent):
                     block = tool_blocks.get(event.tool_id)
                     if block:
@@ -933,6 +954,10 @@ class CodeApp(App):
                     )
                     await ai_row.mount(done_label)
 
+                    if self.agent.in_plan_mode:
+                        asyncio.ensure_future(
+                            self._show_plan_approval()
+                        )
             # 收尾：渲染剩余的累积文本
             if accumulated_text and streaming_label is not None:
                 await streaming_label.remove()
@@ -944,26 +969,66 @@ class CodeApp(App):
             self.call_after_refresh(chat.scroll_end, animate=False)
 
         except asyncio.CancelledError:
-            if accumulated_text:
-                if streaming_label is not None:
-                    await streaming_label.remove()
-                md = Markdown(
-                    accumulated_text + "\n\n*[cancelled]*",
-                    classes="message ai-message",
-                )
-                await ai_row.mount(md)
-            self._show_system_message("Operation cancelled")
+            # task 被取消（用户中断或 app 退出）。UI 操作全程容错——
+            # app 关闭期间 DOM 可能已拆除，query_one/mount/remove 都可能抛 NoMatches。
+            try:
+                if accumulated_text:
+                    if streaming_label is not None:
+                        await streaming_label.remove()
+                    md = Markdown(
+                        accumulated_text + "\n\n*[cancelled]*",
+                        classes="message ai-message",
+                    )
+                    await ai_row.mount(md)
+                self._show_system_message("Operation cancelled")
+            except Exception:
+                pass
+            self._cleanup_pending_askuser()
+            self._cleanup_pending_perm()
         except LLMError as e:
             self._show_error(str(e))
         finally:
             self._finish_streaming()
-            input_widget.focus()
+            try:
+                input_widget.focus()
+            except Exception:
+                pass
 
     def _show_system_message(self, text: str) -> None:
-        chat = self.query_one("#chat-area", VerticalScroll)
+        try:
+            chat = self.query_one("#chat-area", VerticalScroll)
+        except Exception:
+            return  # app 关闭/DOM 已拆时静默
         msg = Static(f"  {text}", classes="message system-message")
         chat.mount(msg)
         self.call_after_refresh(chat.scroll_end, animate=False)
+
+    def _cleanup_pending_askuser(self) -> None:
+        """中断/退出时清理残留的 AskUser 交互：取消未 resolve 的 future，
+        移除内联问答组件。所有操作容错，app 关闭期间也能安全调用。"""
+        req = getattr(self, "_pending_askuser_event", None)
+        if req is not None:
+            if not req.future.done():
+                req.future.cancel()
+            self._pending_askuser_event = None
+        try:
+            self.query_one("#askuser-inline", InlineAskUserWidget).remove()
+        except Exception:
+            pass
+
+    def _cleanup_pending_perm(self) -> None:
+        """中断/退出时清理残留的权限确认弹窗：取消未 resolve 的 future，
+        移除 #perm-inline 组件。所有操作容错，app 关闭期间也能安全调用。"""
+        req = getattr(self, "_pending_perm_request", None)
+        if req is not None:
+            if not req.future.done():
+                req.future.cancel()
+            self._pending_perm_request = None
+        try:
+            self.query_one("#perm-inline", InlinePermissionWidget).remove()
+        except Exception:
+            pass
+        
     """
         清理所有 streaming 状态（取消或完成时调用）。
     """
@@ -972,7 +1037,10 @@ class CodeApp(App):
         self._stop_spinner()
         self._agent_task = None
         if self._spinner_label is not None:
-            self._spinner_label.remove()
+            try:
+                self._spinner_label.remove()
+            except Exception:
+                pass
             self._spinner_label = None
 
     def _start_spinner(self) -> None:
@@ -1004,6 +1072,12 @@ class CodeApp(App):
 
     async def _handle_permission_request(self, request: PermissionRequest) -> None:
 
+        # 防御：若上一个权限弹窗残留（如中断时未清理），先移除，避免 DuplicateIds。
+        # remove() 返回 AwaitRemove，必须 await 才会真正从 DOM 移除，否则紧接 mount 仍会 DuplicateIds。
+        try:
+            await self.query_one("#perm-inline", InlinePermissionWidget).remove()
+        except Exception:
+            pass
         chat = self.query_one("#chat-area", VerticalScroll)
         widget = InlinePermissionWidget(request.tool_name, request.description)
         self._pending_perm_request = request
@@ -1034,3 +1108,110 @@ class CodeApp(App):
             self.query_one("#chat-input").focus()
         except Exception:
             pass
+        
+    async def _handle_askuser(self, event: AskUserRequest) -> None:
+        # 防御：若上一个问答弹窗残留（如中断时未清理），先 await remove，避免 DuplicateIds
+        try:
+            await self.query_one("#askuser-inline", InlineAskUserWidget).remove()
+        except Exception:
+            pass
+        chat = self.query_one("#chat-area", VerticalScroll)
+        widget = InlineAskUserWidget(event.questions)
+        self._pending_askuser_event = event
+        await chat.mount(widget)
+        self.call_after_refresh(chat.scroll_end, animate=False)
+        try:
+            self.query_one("#chat-input").disabled = True
+        except Exception:
+            pass
+
+    def on_inline_ask_user_widget_responded(
+        self, event: "InlineAskUserWidget.Responded"
+    ) -> None:
+        req = getattr(self, "_pending_askuser_event", None)
+        if req is not None and not req.future.done():
+            req.future.set_result(event.answers if event.answers else {})
+            self._pending_askuser_event = None
+        try:
+            self.query_one("#askuser-inline", InlineAskUserWidget).remove()
+        except Exception:
+            pass
+        try:
+            self.query_one("#chat-input").disabled = False
+            self.query_one("#chat-input").focus()
+        except Exception:
+            pass
+        
+    async def _show_plan_approval(self) -> None:
+        # 防御：若上一个计划审批弹窗残留，先 await remove，避免 DuplicateIds
+        try:
+            await self.query_one("#plan-inline", InlinePlanWidget).remove()
+        except Exception:
+            pass
+        chat = self.query_one("#chat-area", VerticalScroll)
+        widget = InlinePlanWidget()
+        await chat.mount(widget)
+        self.call_after_refresh(chat.scroll_end, animate=False)
+        try:
+            self.query_one("#chat-input").disabled = True
+        except Exception:
+            pass
+
+    def on_inline_plan_widget_responded(
+        self, event: "InlinePlanWidget.Responded"
+    ) -> None:
+        try:
+            self.query_one("#plan-inline", InlinePlanWidget).remove()
+        except Exception:
+            pass
+        try:
+            self.query_one("#chat-input").disabled = False
+            self.query_one("#chat-input").focus()
+        except Exception:
+            pass
+
+        if self.agent is None:
+            return
+
+        choice = event.choice
+        feedback = event.feedback
+        plan_path = self.agent._get_plan_path()
+        plan_exists = plan_path.exists()
+        plan_content = ""
+        if plan_exists:
+            try:
+                plan_content = plan_path.read_text(encoding="utf-8")
+            except Exception:
+                pass
+
+        pre = getattr(self, "_pre_plan_mode", PermissionMode.DEFAULT)
+        if choice == PlanChoice.YOLO:
+            self.agent.set_permission_mode(PermissionMode.BYPASS)
+            self._update_mode_label()
+            # 构建退出提示并标记已退出 Plan Mode
+            exit_msg = build_plan_mode_exit_reminder(str(plan_path), plan_exists)
+            self._has_exited_plan_mode = True
+            execute_text = exit_msg + "\n\nUser has approved your plan. You can now start coding."
+            if plan_content:
+                execute_text += "\n\nApproved Plan:\n" + plan_content
+            self.send_user_message(execute_text)
+        elif choice == PlanChoice.MANUAL:
+            self.agent.set_permission_mode(pre)
+            self._update_mode_label()
+            # 构建退出提示并标记已退出 Plan Mode
+            exit_msg = build_plan_mode_exit_reminder(str(plan_path), plan_exists)
+            self._has_exited_plan_mode = True
+            execute_text = exit_msg + "\n\nUser has approved your plan. You can now start coding."
+            if plan_content:
+                execute_text += "\n\nApproved Plan:\n" + plan_content
+            self.send_user_message(execute_text)
+        elif choice == PlanChoice.FEEDBACK:
+            if feedback:
+                self.send_user_message(feedback)
+            else:
+                self._show_system_message("Type your feedback and send.")
+
+    def send_user_message(self, text: str) -> None:
+        if self._streaming or self.agent is None:
+            return
+        self._agent_task = asyncio.create_task(self._send_message(text))

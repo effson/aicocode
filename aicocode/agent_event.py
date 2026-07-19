@@ -92,6 +92,13 @@ class PermissionRequest:
     description: str
     future: asyncio.Future[PermissionResponse]
 
+@dataclass
+class AskUserRequest:
+    """AskUserQuestion 工具触发的交互事件：携带问题列表与一个 future，
+    UI 弹窗收集到用户回答后 set_result(future)，Agent 侧 await 即可拿到答案。"""
+    questions: list[dict[str, Any]]
+    future: asyncio.Future[dict[str, str]]
+
 AgentEvent = (
     StreamText
     | ThinkingText
@@ -103,6 +110,7 @@ AgentEvent = (
     | UsageEvent
     | ErrorEvent
     | PermissionRequest
+    | AskUserRequest
 )
 
 class StreamCollector:
