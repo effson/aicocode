@@ -103,6 +103,44 @@ def validate_sandbox(raw_sb: dict | None) -> dict:
 
     return result
 
+def validate_mcp_servers(raw_mcp: list | None) -> list[dict]:
+    """校验 mcp_servers 配置段，返回清洗后的 server 配置字典列表。"""
+    if raw_mcp is None:
+        return []
+
+    if not isinstance(raw_mcp, list):
+        raise ConfigError("'mcp_servers' must be a list of server configs")
+
+    servers: list[dict] = []
+    for i, entry in enumerate(raw_mcp):
+        if not isinstance(entry, dict):
+            raise ConfigError(f"MCP server #{i + 1}: must be a mapping")
+        name = entry.get("name")
+        if not name:
+            raise ConfigError(f"MCP server #{i + 1}: missing 'name'")
+        has_command = "command" in entry
+        has_url = "url" in entry
+        if has_command and has_url:
+            raise ConfigError(
+                f"MCP server '{name}': cannot have both 'command' and 'url'"
+            )
+        if not has_command and not has_url:
+            raise ConfigError(
+                f"MCP server '{name}': must have either 'command' or 'url'"
+            )
+        servers.append(
+            {
+                "name": name,
+                "command": entry.get("command"),
+                "args": entry.get("args", []),
+                "url": entry.get("url"),
+                "headers": entry.get("headers", {}),
+                "env": entry.get("env", {}),
+            }
+        )
+
+    return servers
+
 """
     模型配置
 """
@@ -137,7 +175,7 @@ def lookup_model_context_window(model: str) -> int:
 """
 校验的主入口。校验解析后的原始配置，返回清洗后的字典。
 返回的字典目前包含以下键：
-providers
+providers permission_mode sandbox mcp_servers
 """
 def validate_config(raw: object) -> dict:
     """
@@ -150,4 +188,5 @@ def validate_config(raw: object) -> dict:
         "providers": validate_providers(raw["providers"]),
         "permission_mode": validate_permission_mode(raw.get("permission_mode", "default")),
         "sandbox": validate_sandbox(raw.get("sandbox")),
+        "mcp_servers": validate_mcp_servers(raw.get("mcp_servers")),
     }

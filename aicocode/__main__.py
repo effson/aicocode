@@ -49,5 +49,6 @@ def main() -> None:
         permission_mode=permission_mode,
         driver_class=NoAltScreenDriver,
         sandbox_config=config.sandbox,
+        mcp_servers=config.mcp_servers,
     )
     app.run()

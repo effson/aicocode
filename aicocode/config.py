@@ -89,6 +89,32 @@ class ProviderConfig:
             return 64000
         return 8192
 
+def resolve_env_vars(value: str) -> str:
+    return _ENV_VAR_RE.sub(lambda m: os.environ.get(m.group(1), m.group(0)), value)
+
+def build_child_env(declared_env: dict[str, str] | None) -> dict[str, str]:
+    env: dict[str, str] = {}
+    path = os.environ.get("PATH", "")
+    if path:
+        env["PATH"] = path
+    for key, value in (declared_env or {}).items():
+        env[key] = resolve_env_vars(value)
+    return env
+
+@dataclass
+class MCPServerConfig:
+    name: str
+    command: str | None = None
+    args: list[str] = field(default_factory=list)
+    url: str | None = None
+    headers: dict[str, str] = field(default_factory=dict)
+    env: dict[str, str] = field(default_factory=dict)
+
+
+    @property
+    def is_stdio(self) -> bool:
+        return self.command is not None
+
 @dataclass
 class SandboxAppConfig:
     """沙箱相关的配置项。"""
@@ -105,6 +131,7 @@ class AppConfig:
     providers: list[ProviderConfig]
     permission_mode: str = "default"
     sandbox: SandboxAppConfig = field(default_factory=SandboxAppConfig)
+    mcp_servers: list[MCPServerConfig] = field(default_factory=list)
 
 def _load_config_yaml(path: Path) -> AppConfig:
     try:
@@ -128,6 +155,18 @@ def _load_config_yaml(path: Path) -> AppConfig:
         for p in validated_config["providers"]
     ]
 
+    mcp_servers = [
+        MCPServerConfig(
+            name=s["name"],
+            command=s["command"],
+            args=s["args"],
+            url=s["url"],
+            headers=s["headers"],
+            env=s["env"],
+        )
+        for s in validated_config["mcp_servers"]
+    ]
+
     sb = validated_config["sandbox"]
     sandbox_cfg = SandboxAppConfig(
         enabled=sb["enabled"],
@@ -139,6 +178,7 @@ def _load_config_yaml(path: Path) -> AppConfig:
         providers=providers,
         permission_mode=validated_config["permission_mode"],
         sandbox=sandbox_cfg,
+        mcp_servers=mcp_servers,
     )
 
 def _merge_existing_config(base: AppConfig, override: AppConfig) -> AppConfig:
@@ -146,6 +186,14 @@ def _merge_existing_config(base: AppConfig, override: AppConfig) -> AppConfig:
         base.providers = override.providers
     if override.permission_mode != "default":
         base.permission_mode = override.permission_mode
+    if override.mcp_servers:
+        by_name = {s.name: i for i, s in enumerate(base.mcp_servers)}
+        for s in override.mcp_servers:
+            if s.name in by_name:
+                base.mcp_servers[by_name[s.name]] = s
+            else:
+                base.mcp_servers.append(s)
+                by_name[s.name] = len(base.mcp_servers) - 1
 
     if override.sandbox.enabled:
         base.sandbox.enabled = True

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import asyncio
 import os
 import random
@@ -57,7 +58,7 @@ from aicocode.llm_client import (
     resolve_context_window,
 )
 
-from aicocode.config import ProviderConfig, SandboxAppConfig
+from aicocode.config import ProviderConfig, SandboxAppConfig, MCPServerConfig
 from aicocode.conversation import Conversation, Message
 from aicocode.commands.popup_completion import CompletionPopup
 from aicocode.prompt import build_environment_context
@@ -68,6 +69,7 @@ from aicocode.tools.exit_plan_mode import ExitPlanModeTool
 from aicocode.askuser_dialog import InlineAskUserWidget
 from aicocode.plan_dialog import InlinePlanWidget, PlanChoice
 from aicocode.prompt import build_plan_mode_exit_reminder
+from aicocode.mcp.manager import MCPManager, ConnectResult
 from aicocode.Permissions import (
     PermissionMode,
     PermissionValidator,
@@ -77,6 +79,8 @@ from aicocode.Permissions import (
 )
 
 import re
+
+logger = logging.getLogger(__name__)
 
 MAX_TRUNCATED_LINES = 20
 MAX_AT_REF_DOC_BYTES = 10240
@@ -526,6 +530,7 @@ class CodeApp(App):
         permission_mode: PermissionMode = PermissionMode.DEFAULT,
         driver_class: type | None = None,
         sandbox_config: Any = None,
+        mcp_servers: list[MCPServerConfig] | None = None,
     ) -> None:
         super().__init__(driver_class=driver_class)
         self.providers = providers
@@ -547,6 +552,13 @@ class CodeApp(App):
         self._instructions_content: str = ""
         self._sandbox_cfg: SandboxAppConfig = sandbox_config or SandboxAppConfig()
         self._has_exited_plan_mode: bool = False
+        self._mcp_server_configs = mcp_servers or []
+        self.mcp_manager: MCPManager | None = None
+        self._mcp_init_task: asyncio.Task[None] | None = None
+        self._mcp_server_info: str = ""
+        self._mcp_instructions: str = ""
+        self._mcp_instructions_ok: bool = False
+        self._mcp_connecting: bool = False
 
     @staticmethod
     def _make_banner(model: str = "", work_dir: str = "") -> RichText:
@@ -637,6 +649,9 @@ class CodeApp(App):
         self._exit_plan_tool._is_plan_mode = lambda: self.agent.in_plan_mode
         self._exit_plan_tool._plan_file_exists = lambda: self.agent._get_plan_path().exists()
 
+        if self._mcp_server_configs:
+            self._mcp_init_task = asyncio.create_task(self._init_mcp())
+
         self.query_one("#model-label", Static).update(provider.model)
         work_dir = os.getcwd()
         self.query_one("#title-bar", Static).update(
@@ -655,6 +670,65 @@ class CodeApp(App):
         chat_input.load_history(work_dir)
         chat_input.focus()
 
+    """
+        MCP 初始化
+    """
+    async def _init_mcp(self) -> None:
+        self._mcp_connecting = True
+        self._update_mode_label()
+        manager = MCPManager()
+        manager.load_configs(self._mcp_server_configs)
+        tools_before = len(self.registry.list_tools())
+        connect_result: ConnectResult = await manager.register_all_tools(self.registry)
+        self.mcp_manager = manager
+        self._mcp_connecting = False
+        self._update_mode_label()
+        logger.info("Registered MCP tool done.")
+        for err in connect_result.errors:
+            self._show_system_message(f"MCP warning: {err}")
+        tools_after = len(self.registry.list_tools())
+        mcp_tools = tools_after - tools_before
+        server_count = len(connect_result.servers)
+        if server_count > 0:
+            self._mcp_server_info = (
+                f"Connected to {server_count} MCP server(s), {mcp_tools} tools registered"
+            )
+        if server_count > 0 and mcp_tools > 0:
+            # 构建 MCP 指令：从 InitializeResult 提取 instructions
+            parts = []
+            for srv_info in connect_result.servers:
+                section = f"## {srv_info.name}\n"
+                # 优先使用服务器返回的 instructions
+                if srv_info.instructions:
+                    section += srv_info.instructions
+                else:
+                    # 回退：列出该服务器注册的工具名
+                    tool_names = [
+                        t.name for t in self.registry.list_tools()
+                        if t.name.startswith(f"mcp_{srv_info.name}")
+                    ]
+                    if tool_names:
+                        section += "Available tools: " + ", ".join(tool_names)
+                parts.append(section)
+            self._mcp_instructions = (
+                "# MCP Server Instructions\n\n"
+                "The following MCP servers have provided instructions "
+                "for how to use their tools and resources:\n\n"
+                + "\n\n".join(parts)
+            )
+
+    async def _shutdown_mcp(self) -> None:
+        if self._mcp_init_task is not None:
+            self._mcp_init_task.cancel()
+            try:
+                await self._mcp_init_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._mcp_init_task = None
+        if self.mcp_manager is not None:
+            await self.mcp_manager.shutdown()
+            self.mcp_manager = None
+
     def _show_error(self, text: str) -> None:
         try:
             chat = self.query_one("#chat-area", VerticalScroll)
@@ -671,6 +745,7 @@ class CodeApp(App):
             self._select_provider(provider)
 
     """
+    <程序退出>
       ┌────────────────────────┬───────────────────────────┐                                                                                                                                
       │ Ctrl+C(流式处理中)       │ 中断当前响应,不退出          │                                                                                                                                 
       ├────────────────────────┼───────────────────────────┤                                                                                                                                 
@@ -702,6 +777,7 @@ class CodeApp(App):
 
         async def _cleanup() -> None:
             tasks: list[asyncio.Task] = []
+            tasks.append(asyncio.create_task(self._shutdown_mcp()))
 
             if tasks:
                 await asyncio.wait(tasks, timeout=3.0)
@@ -743,11 +819,14 @@ class CodeApp(App):
             if perm == PermissionMode.DEFAULT:
                 label.update(f"[{color}]{display}[/{color}]")
             else:
-                label.update(f"[{color}]{display}[/{color}]  (shift+tab to cycle)")
+                label.update(f"[{color}]{display}[/{color}]  (shift+tab to cycle permission mode)")
         try:
             model_label = self.query_one("#model-label", Static)
             model_text = self._selected_provider.model if self._selected_provider else ""
-            model_label.update(model_text)
+            if self._mcp_connecting:
+                model_label.update(f"[yellow]MCP connecting…[/yellow]  {model_text}")
+            else:
+                model_label.update(model_text)
         except Exception:
             pass
 
@@ -802,6 +881,10 @@ class CodeApp(App):
         return
 
     async def _send_message(self, text: str, is_notification: bool = False) -> None:
+        if self._mcp_init_task and not self._mcp_init_task.done():
+            self._show_system_message("Waiting for MCP servers to connect...")
+            await self._mcp_init_task
+
         self._streaming = True
         chat = self.query_one("#chat-area", VerticalScroll)
         input_widget = self.query_one("#chat-input", ChatInput)
@@ -827,6 +910,10 @@ class CodeApp(App):
             self.call_after_refresh(chat.scroll_end, animate=False)
 
             self.conversation.add_user_message(text)
+
+        if self._mcp_instructions and not self._mcp_instructions_ok:
+            self.conversation.add_system_reminder(self._mcp_instructions)
+            self._mcp_instructions_ok = True
 
         history_cursor = len(self.conversation.messages)
 
