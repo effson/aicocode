@@ -48,6 +48,7 @@ from aicocode.agent_event import (
     PermissionResponse,
     PermissionRequest,
     AskUserRequest,
+    CompactNotification,
 )
 
 from aicocode.llm_client import (
@@ -649,6 +650,10 @@ class CodeApp(App):
         self._exit_plan_tool._is_plan_mode = lambda: self.agent.in_plan_mode
         self._exit_plan_tool._plan_file_exists = lambda: self.agent._get_plan_path().exists()
 
+        self.run_worker(
+            self._resolve_context_window(provider), exclusive=False
+        )
+
         if self._mcp_server_configs:
             self._mcp_init_task = asyncio.create_task(self._init_mcp())
 
@@ -669,6 +674,14 @@ class CodeApp(App):
         chat_input.placeholder = "Send a message..."
         chat_input.load_history(work_dir)
         chat_input.focus()
+
+    async def _resolve_context_window(self, provider: ProviderConfig) -> None:
+        """
+            Layer 2 后台 worker：异步拉取模型的 context window，
+        """
+        await resolve_context_window(provider)
+        if self.agent is not None:
+            self.agent.context_window = provider.get_context_window()
 
     """
         MCP 初始化
@@ -1022,6 +1035,9 @@ class CodeApp(App):
 
                 elif isinstance(event, UsageEvent):
                     pass  # token 展示已移除
+
+                elif isinstance(event, CompactNotification):
+                    self._show_system_message(event.message)
 
                 elif isinstance(event, ErrorEvent):
                     # 保留错误前已输出的流式文本

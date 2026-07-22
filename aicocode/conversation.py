@@ -32,6 +32,29 @@ class Message:
     tool_results: list[ToolResultBlock] = field(default_factory=list)
     thinking_blocks: list[ThinkingBlock] = field(default_factory=list)
 
+_CHARS_PER_TOKEN = 3.5
+
+def _message_chars(m: Message) -> int:
+    n = len(m.content)
+    for tb in m.thinking_blocks:
+        n += len(tb.thinking)
+    for tu in m.tool_uses:
+        n += len(tu.tool_name) + len(json.dumps(tu.arguments, ensure_ascii=False))
+    for tr in m.tool_results:
+        n += len(tr.content)
+    return n
+
+
+def estimate_tokens(messages: list[Message]) -> int:
+    """基于字符数对一组消息做 token 估算。
+
+    刻意做得粗略——它只覆盖那些尚未锚定到真实 API 用量数值的消息，这部分的
+    精确度本就无关紧要。统计内容包括消息正文、thinking、工具调用参数以及
+    工具结果内容。
+    """
+    total = sum(_message_chars(m) for m in messages)
+    return int(total / _CHARS_PER_TOKEN)
+
 @dataclass
 class Conversation:
     """
@@ -39,6 +62,9 @@ class Conversation:
     """
     messages: list[Message] = field(default_factory=list)
     env_injected: bool = field(default=False, init=False)
+    last_input_tokens: int = field(default=0, init=False)
+    baseline_tokens: int = field(default=0, init=False)
+    anchor_count: int = field(default=0, init=False)
 
     def add_user_message(self, content: str) -> None:
         """追加用户消息。"""
@@ -84,6 +110,50 @@ class Conversation:
 
     def fetch_messages(self) -> list[Message]:
         return list(self.messages)
+
+    def record_usage_anchor(
+        self,
+        input_tokens: int,
+        output_tokens: int = 0,
+        cache_read: int = 0,
+        cache_creation: int = 0,
+    ) -> None:
+        """根据一次 API 响应钉下一个真实用量锚点。
+
+        baseline = input + cache_read + cache_creation + output。各家服务商
+        返回的 input_tokens 已经排除了命中缓存的 token，所以这三个 input 分量
+        是相加关系，合起来才是真正的 prompt 大小；之所以再加上 output，是因为
+        assistant 的回复此刻已成为历史的一部分。anchor_count 对齐到当前的消息
+        数量，这样后续新追加的消息就成了唯一需要估算的部分。
+        """
+        self.baseline_tokens = (
+            input_tokens + cache_read + cache_creation + output_tokens
+        )
+        self.anchor_count = len(self.messages)
+        # 保持旧字段同步，兼容仍在使用它的读取方。
+        self.last_input_tokens = self.baseline_tokens
+
+    def current_tokens(self) -> int:
+        """
+        对当前对话中的 token 数量做出最佳估算。
+        有锚点时：baseline（真实用量）+ 仅对锚点之后追加的那些消息做字符估算。
+        没有锚点时（冷启动，或刚经历一次压缩重置）：对整个历史做字符估算，
+        """
+        if self.baseline_tokens <= 0:
+            return estimate_tokens(self.messages)
+        tail = self.messages[self.anchor_count:]
+        return self.baseline_tokens + estimate_tokens(tail)
+
+    def replace_messages(self, new_messages: list[Message]) -> None:
+        self.messages = new_messages
+        self.env_injected = False
+        self.ltm_injected = False
+        # 旧的用量锚点描述的是压缩前的对话记录，这里清除它，
+        # 使 current_tokens() 退化为字符估算，直到下次 API 响应
+        # 基于摘要后的历史重新建立锚点。
+        self.baseline_tokens = 0
+        self.anchor_count = 0
+        self.last_input_tokens = 0
 
     def __len__(self) -> int:
         return len(self.messages)

@@ -19,6 +19,10 @@ from aicocode.base import (
 
 from aicocode.tools.tool_base import ToolResult
 
+from aicocode.context import(
+    CompactBoundary,
+)
+
 @dataclass
 class ThinkingBlock:
     thinking: str
@@ -99,6 +103,14 @@ class AskUserRequest:
     questions: list[dict[str, Any]]
     future: asyncio.Future[dict[str, str]]
 
+@dataclass
+class CompactNotification:
+    before_tokens: int
+    message: str
+    # 结构化 boundary（摘要 + 原文保留尾部），UI/session 层用它持久化 compact_boundary 记录。
+    # 失败路径下为 None。
+    boundary: "CompactBoundary | None" = None
+
 AgentEvent = (
     StreamText
     | ThinkingText
@@ -111,6 +123,7 @@ AgentEvent = (
     | ErrorEvent
     | PermissionRequest
     | AskUserRequest
+    | CompactNotification
 )
 
 class StreamCollector:

@@ -36,6 +36,7 @@ from aicocode.agent_event import (
     PermissionResponse,
     PermissionRequest,
     AskUserRequest,
+    CompactNotification
 )
 
 from aicocode.prompt import build_environment_context, build_system_prompt, build_plan_mode_reminder
@@ -57,6 +58,18 @@ from aicocode.tools.tool_base import (
 )
 
 from aicocode.conversation import Conversation, ToolUseBlock, ToolResultBlock
+from aicocode.context import (
+    apply_tool_result_budget,
+    ensure_session_dir,
+    ToolResReplacementState,
+    create_replacement_state,
+    append_replacement_records,
+    CompactBreaker,
+    auto_compact,
+    RecoveryState,
+    CompactEvent,
+)
+
 
 from aicocode.tools import ToolRegistry
 from aicocode.tools.ask_user import AskUserTool
@@ -96,6 +109,17 @@ class Agent:
         self.total_output_tokens: int = 0
         self.agent_id: str = uuid.uuid4().hex[:12]
         self.parent_id: str | None = None
+        self.session_dir = ensure_session_dir(work_dir)
+        self.replacement_state: ToolResReplacementState = create_replacement_state()
+        self.compact_breaker = CompactBreaker()
+        self.recovery_state: RecoveryState = RecoveryState()
+        self.session_id: str = ""
+
+    @property
+    def _transcript_path(self) -> str:
+        if self.session_id:
+            return str(Path(self.work_dir) / ".aicocode" / "sessions" / f"{self.session_id}.jsonl")
+        return ""
 
     async def _execute_single_tool_direct(
         self, tc: ToolCallComplete
@@ -139,6 +163,8 @@ class Agent:
             result = ToolResult(output=f"Parameter validation error: {e}", is_error=True)
         except Exception as e:
             result = ToolResult(output=f"Tool execution error: {e}", is_error=True)
+
+        self._snapshot_for_recovery(tc, result)
 
         return _ToolExecResult(
             tool_id=tc.tool_id,
@@ -260,9 +286,32 @@ class Agent:
             result = ToolResult(
                 output=f"Tool execution error: {e}", is_error=True
             )
+
+        self._snapshot_for_recovery(tc, result)
+
         elapsed = time.monotonic() - start
         yield result, elapsed, is_unknown
-
+    
+    def _snapshot_for_recovery(
+        self, tc: ToolCallComplete, result: ToolResult
+    ) -> None:
+        """捕获 ReadFile 刚交给模型的内容，以便 Layer 2 压缩对话后
+        auto_compact 能重新附加这些数据。每次 ReadFile 多一次磁盘读取，
+        比从 tool 输出中反向解析行号要划算。
+        """
+        if result.is_error or tc.tool_name != "ReadFile":
+            return
+        path = tc.arguments.get("file_path") if isinstance(tc.arguments, dict) else None
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                content = fh.read()
+        except OSError:
+            return
+        logging.info(f"Snapshot for: {path}")
+        self.recovery_state.record_file_read(path, content)
+    
     def set_permission_mode(self, permission_mode: PermissionMode) -> None:
         self.permission_mode = permission_mode
         if self.permission_validator:
@@ -328,6 +377,38 @@ class Agent:
 
             tools = self.registry.get_all_schemas(self.protocol)
 
+            new_records = apply_tool_result_budget(
+                conversation, self.session_dir, self.replacement_state
+            )
+            if new_records:
+                append_replacement_records(self.session_dir, new_records)
+
+            compact_result = await auto_compact(
+                conversation=conversation,
+                client=self.client,
+                context_window=self.context_window,
+                session_dir=self.session_dir,
+                protocol=self.protocol,
+                breaker=self.compact_breaker,
+                recovery=self.recovery_state,
+                tool_schemas=self.registry.get_all_schemas(self.protocol),
+                transcript_path=self._transcript_path,
+            )
+
+            if isinstance(compact_result, CompactEvent):
+                yield CompactNotification(
+                    before_tokens=compact_result.before_tokens,
+                    message=f"上下文已压缩（压缩前 [{compact_result.before_tokens}] tokens）",
+                    boundary=compact_result.boundary,
+                )
+                conversation.inject_environment_context(env_context)
+                apply_tool_result_budget(
+                    conversation, self.session_dir, self.replacement_state
+                )
+
+            elif isinstance(compact_result, str):
+                yield ErrorEvent(message=compact_result)
+
             collector = StreamCollector()
             executor = StreamingExecutor()
             deferred_tool_calls: list[ToolCallComplete] = []
@@ -385,9 +466,17 @@ class Agent:
                 response.text, tool_uses, thinking_blocks=conv_thinking
             )
 
+            conversation.record_usage_anchor(
+                response.input_tokens,
+                response.output_tokens,
+                response.cache_read,
+                response.cache_creation,
+            )
+
             # 收集流式执行器中已提交的工具结果（工具在 LLM 流式输出期间已开始执行）
             tool_results: list[ToolResultBlock] = []
             streaming_results: list[_ToolExecResult] = await executor.collect_results()
+            args_by_id = {t.tool_id: t.arguments for t in response.tool_calls}
 
             for tool_exec_res in streaming_results:
                 if tool_exec_res.is_unknown:
@@ -395,10 +484,17 @@ class Agent:
                 else:
                     consecutive_unknown = 0
 
+                content = self._maybe_persist_or_truncate(
+                    tool_exec_res.tool_id,
+                    tool_exec_res.result.output,
+                    tool_exec_res.tool_name,
+                    args_by_id.get(tool_exec_res.tool_id, {}),
+                )
+
                 tool_results.append(
                     ToolResultBlock(
                         tool_use_id=tool_exec_res.tool_id,
-                        content=tool_exec_res.result.output,
+                        content=content,
                         is_error=tool_exec_res.result.is_error,
                     )
                 )
@@ -430,10 +526,14 @@ class Agent:
                 else:
                     consecutive_unknown = 0
 
+                content = self._maybe_persist_or_truncate(
+                    tc.tool_id, result.output, tc.tool_name, tc.arguments
+                )
+
                 tool_results.append(
                     ToolResultBlock(
                         tool_use_id=tc.tool_id,
-                        content=result.output,
+                        content=content,
                         is_error=result.is_error,
                     )
                 )
@@ -463,3 +563,31 @@ class Agent:
                 break
 
             yield TurnComplete(turn=iteration)
+
+    def _maybe_persist_or_truncate(
+        self,
+        tool_use_id: str,
+        text: str,
+        tool_name: str = "",
+        arguments: dict | None = None,
+    ) -> str:
+        from aicocode.context.manager import (
+            SINGLE_RESULT_CHAR_LIMIT,
+            is_spill_readback_call,
+            make_persisted_tool_result_preview,
+            persist_tool_result,
+        )
+
+        # 回读豁免：模型用 ReadFile 读取 session_dir 下的落盘文件时，结果本身
+        # 就是已落盘内容的回读。再次落盘/截断会陷入「落盘→回读→再落盘」循环，
+        # 且让模型刚读到的完整内容瞬间又被截掉。这里原样返回，把这条结果交给
+        # Layer 2（auto_compact）按总量清理。
+        if is_spill_readback_call(tool_name, arguments, self.session_dir):
+            return text
+
+        if len(text) > SINGLE_RESULT_CHAR_LIMIT:
+            fp = persist_tool_result(tool_use_id, text, self.session_dir)
+            return make_persisted_tool_result_preview(text, fp)
+        # if len(text) > MAX_OUTPUT_CHARS:
+        #     return text[:MAX_OUTPUT_CHARS] + "\n… (output truncated)"
+        return text

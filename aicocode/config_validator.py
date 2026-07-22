@@ -1,6 +1,10 @@
 """AicoCode 的配置校验"""
 
 from typing import Literal
+import logging
+
+log = logging.getLogger(__name__)
+
 """
     模型提供商配置
 """
@@ -152,6 +156,7 @@ DEFAULT_CONTEXT_WINDOW = 200_000
 MODEL_CONTEXT_WINDOWS: list[tuple[str, int]] = [
     ("1m", 1_000_000),       # 也覆盖 "-1m" 后缀（如 claude-...-1m）
     ("gpt-4.1", 1_000_000),  # GPT-4.1 系列的 window 为 1M
+    ("glm-5", 1_000_000),
     ("gpt-4o", 128_000),
     ("gpt-4-turbo", 128_000),
     ("o1", 200_000),         # OpenAI 推理模型 o1 / o3 / o4
