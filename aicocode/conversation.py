@@ -62,6 +62,7 @@ class Conversation:
     """
     messages: list[Message] = field(default_factory=list)
     env_injected: bool = field(default=False, init=False)
+    long_term_injected: bool = field(default=False, init=False)
     last_input_tokens: int = field(default=0, init=False)
     baseline_tokens: int = field(default=0, init=False)
     anchor_count: int = field(default=0, init=False)
@@ -108,6 +109,42 @@ class Conversation:
             self.messages.insert(0, Message(role="user", content=context))
             self.env_injected = True
 
+
+    def inject_long_term_memory(
+        self, instructions: str, memories: str
+    ) -> None:
+        if self.long_term_injected:
+            return
+        sections: list[str] = []
+        if instructions:
+            sections.append(
+                "# aicocodeMd\n"
+                "Codebase and user instructions are shown below. "
+                "Be sure to adhere to these instructions. "
+                "IMPORTANT: These instructions OVERRIDE any default behavior "
+                "and you MUST follow them exactly as written.\n\n" + instructions
+            )
+        if memories:
+            sections.append("# autoMemory\n" + memories)
+        if not sections:
+            return
+        from datetime import date
+
+        sections.append(f"# currentDate\nToday's date is {date.today().isoformat()}.")
+        body = "\n\n".join(sections)
+        wrapped = (
+            "<system-reminder>\n"
+            "As you answer the user's questions, you can use the following context:\n"
+            + body
+            + "\n\n      IMPORTANT: this context may or may not be relevant to your tasks."
+            " You should not respond to this context unless it is highly relevant to your task.\n"
+            "</system-reminder>"
+        )
+        pos = 1 if self.env_injected else 0
+        self.messages.insert(pos, Message(role="user", content=wrapped))
+        self.long_term_injected = True
+
+
     def fetch_messages(self) -> list[Message]:
         return list(self.messages)
 
@@ -147,7 +184,7 @@ class Conversation:
     def replace_messages(self, new_messages: list[Message]) -> None:
         self.messages = new_messages
         self.env_injected = False
-        self.ltm_injected = False
+        self.long_term_injected = False
         # 旧的用量锚点描述的是压缩前的对话记录，这里清除它，
         # 使 current_tokens() 退化为字符估算，直到下次 API 响应
         # 基于摘要后的历史重新建立锚点。

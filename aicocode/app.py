@@ -79,6 +79,17 @@ from aicocode.Permissions import (
     RuleEngine,
 )
 
+from aicocode.memory import(
+    MemoryManager,
+    Session,
+    SessionManager,
+    find_relevant_memories,
+    generate_session_summary,
+    load_instructions,
+    make_compact_boundary,
+    render_reminder,
+)
+
 import re
 
 logger = logging.getLogger(__name__)
@@ -86,7 +97,7 @@ logger = logging.getLogger(__name__)
 MAX_TRUNCATED_LINES = 20
 MAX_AT_REF_DOC_BYTES = 10240
 _AT_REF_DOC_RE = re.compile(r"@([\w./_\-]+(?:\.[\w]+)*)")
-_SKIPPED_DOC_DIRS = {".git", "node_modules", ".venv", "__pycache__", ".mewcode", "build", ".gradle"}
+_SKIPPED_DOC_DIRS = {".git", "node_modules", ".venv", "__pycache__", ".aicocode", "build", ".gradle"}
 
 """
     扫描工作目录,为输入框输入的 @文件名 引用提供自动补全候选(跳过 .git/node_modules 等)。
@@ -560,6 +571,9 @@ class CodeApp(App):
         self._mcp_instructions: str = ""
         self._mcp_instructions_ok: bool = False
         self._mcp_connecting: bool = False
+        self.memory_manager: MemoryManager | None = None
+        self.session_manager: SessionManager | None = None
+        self.session: Session | None = None
 
     @staticmethod
     def _make_banner(model: str = "", work_dir: str = "") -> RichText:
@@ -628,7 +642,19 @@ class CodeApp(App):
             permission_mode=self._initial_permission_mode,
             os_sandbox_enabled=sandbox_auto_allow,
         )
-        
+
+        self._instructions_content = load_instructions(work_dir)
+        self.memory_manager = MemoryManager(work_dir)
+        self.session_manager = SessionManager(work_dir)
+        self.session_manager.cleanup()
+        self.session = self.session_manager.create()
+
+        from aicocode.file_history import FileHistory
+        self.file_history = FileHistory(work_dir, self.session.session_id)
+        for tool in self.registry.list_tools():
+            if hasattr(tool, "file_history"):
+                tool.file_history = self.file_history
+
         self.registry.register_tool(
             ToolSearchTool(self.registry, protocol=provider.protocol)
         )
@@ -644,8 +670,12 @@ class CodeApp(App):
             work_dir=work_dir,
             permission_validator=permissionvalidator,
             context_window=provider.get_context_window(),
+            memory_manager=self.memory_manager,
             instructions_content=self._instructions_content,
         )
+
+        self.agent.file_history = self.file_history
+        self.agent.session_id = self.session.session_id
 
         self._exit_plan_tool._is_plan_mode = lambda: self.agent.in_plan_mode
         self._exit_plan_tool._plan_file_exists = lambda: self.agent._get_plan_path().exists()
@@ -790,6 +820,12 @@ class CodeApp(App):
 
         async def _cleanup() -> None:
             tasks: list[asyncio.Task] = []
+
+            if self.agent and self.agent.memory_manager:
+                tasks.append(asyncio.create_task(
+                    self.agent._extract_memories(self.conversation)
+                ))
+
             tasks.append(asyncio.create_task(self._shutdown_mcp()))
 
             if tasks:
@@ -797,7 +833,10 @@ class CodeApp(App):
                 for t in tasks:
                     if not t.done():
                         t.cancel()
-
+            
+            if self.session:
+                self.session.close()
+            
         try:
             await _cleanup()
         except Exception:
@@ -893,6 +932,50 @@ class CodeApp(App):
         self._agent_task = asyncio.create_task(self._send_message(text))
         return
 
+
+    async def _prefetch_relevant_memories(self, query: str) -> str:
+        """
+        Run the recall selector as a side-query with an 8s timeout.
+        Returns therendered system-reminder body, or "" on any failure / timeout.
+        """
+        if self.memory_manager is None or self._selected_provider is None:
+            return ""
+
+        provider = self._selected_provider
+        user_dir = self.memory_manager.user_mem_dir
+        project_dir = self.memory_manager.project_mem_dir
+
+        async def selector(system_prompt: str, user_message: str) -> str:
+            from aicocode.base import StreamEnd, TextDelta
+
+            side_client = create_client(provider)
+            mini_conv = Conversation()
+            mini_conv.messages = [Message(role="user", content=user_message)]
+            collected = ""
+            async for event in side_client.stream(mini_conv, system=system_prompt):
+                if isinstance(event, TextDelta):
+                    collected += event.text
+                elif isinstance(event, StreamEnd):
+                    pass
+            return collected
+
+        try:
+            results = await asyncio.wait_for(
+                find_relevant_memories(
+                    query=query,
+                    user_mem_dir=user_dir,
+                    project_mem_dir=project_dir,
+                    recent_tools=None,
+                    already_surfaced=None,
+                    selector=selector,
+                ),
+                timeout=8.0,
+            )
+            return render_reminder(results)
+        except (asyncio.TimeoutError, Exception):
+            return ""
+
+
     async def _send_message(self, text: str, is_notification: bool = False) -> None:
         if self._mcp_init_task and not self._mcp_init_task.done():
             self._show_system_message("Waiting for MCP servers to connect...")
@@ -903,13 +986,12 @@ class CodeApp(App):
         input_widget = self.query_one("#chat-input", ChatInput)
 
         if text and "@" in text:
-            work_dir = os.getcwd()
-            text = expand_at_refs_doc(text, work_dir)
+            text = expand_at_refs_doc(text, self.agent.work_dir)
 
-        # Start memory recall prefetch before UI work.
-        # prefetch_task = asyncio.create_task(
-        #     self._prefetch_relevant_memories(text)
-        # ) if text else None
+        # Start memory recall prefetch
+        prefetch_task = asyncio.create_task(
+            self._prefetch_relevant_memories(text)
+        ) if text else None
 
         if text:
             user_row = Vertical(classes="user-row")
@@ -923,12 +1005,18 @@ class CodeApp(App):
             self.call_after_refresh(chat.scroll_end, animate=False)
 
             self.conversation.add_user_message(text)
+            if self.session:
+                self.session.append(Message(role="user", content=text))
 
         if self._mcp_instructions and not self._mcp_instructions_ok:
             self.conversation.add_system_reminder(self._mcp_instructions)
             self._mcp_instructions_ok = True
 
-        history_cursor = len(self.conversation.messages)
+        if prefetch_task is not None:
+            self.agent.memory_recall_task = prefetch_task
+            self.agent._memory_recall_consumed = False
+
+        messages_cursor = len(self.conversation.messages)
 
         # 准备 AI 回复区域
         ai_row = Vertical(classes="ai-row")
@@ -1008,6 +1096,11 @@ class CodeApp(App):
                     self.call_after_refresh(chat.scroll_end, animate=False)
 
                 elif isinstance(event, TurnComplete):
+                    if self.session:
+                        for msg in self.conversation.messages[messages_cursor:]:
+                            self.session.append(msg)
+                        messages_cursor = len(self.conversation.messages)
+
                     collapsible = [
                         (tid, blk) for tid, blk in tool_blocks.items()
                         if isinstance(blk, ToolCallBlock)
@@ -1038,6 +1131,11 @@ class CodeApp(App):
 
                 elif isinstance(event, CompactNotification):
                     self._show_system_message(event.message)
+                    self._persist_compact_boundary(event)
+                    messages_cursor = len(self.conversation.messages)
+
+                elif isinstance(event, RetryEvent):
+                    self._show_system_message(f"↻ Retrying: {event.reason}")
 
                 elif isinstance(event, ErrorEvent):
                     # 保留错误前已输出的流式文本
@@ -1056,6 +1154,18 @@ class CodeApp(App):
                         classes="message thinking-done",
                     )
                     await ai_row.mount(done_label)
+
+                    if self.session:
+                        for msg in self.conversation.messages[messages_cursor:]:
+                            self.session.append(msg)
+                        messages_cursor = len(self.conversation.messages)
+                        self.session.meta.total_tokens = (
+                            self.agent.total_input_tokens
+                            + self.agent.total_output_tokens
+                        )
+                        asyncio.ensure_future(
+                            self._update_session_summary()
+                        )
 
                     if self.agent.in_plan_mode:
                         asyncio.ensure_future(
@@ -1318,3 +1428,34 @@ class CodeApp(App):
         if self._streaming or self.agent is None:
             return
         self._agent_task = asyncio.create_task(self._send_message(text))
+
+    def _persist_compact_boundary(self, notification: CompactNotification) -> None:
+        """
+        auto-compact 后写入 compact_boundary 记录。
+        将摘要 + 原样保留的尾部内联到一条记录中，resume 时只需这一条
+        就能重建压缩后的状态。之前已写入磁盘的原始前缀不会被重放。
+        没有活跃 session 或 compact 未产出 boundary 时直接跳过。
+        """
+        if not self.session or notification.boundary is None:
+            return
+        record = make_compact_boundary(
+            notification.boundary.summary,
+            notification.boundary.keep,
+        )
+        self.session.append_record(record)
+
+
+    async def _update_session_summary(self) -> None:
+        if not self.session or not self.client or not self.agent:
+            return
+        try:
+            summary = await generate_session_summary(
+                self.client, self.conversation, self.agent.protocol
+            )
+            if summary:
+                self.session.meta.summary = summary
+                self.session.meta.save(
+                    self.session._sessions_dir / f"{self.session.session_id}.meta"
+                )
+        except Exception:
+            pass

@@ -75,9 +75,14 @@ from aicocode.tools import ToolRegistry
 from aicocode.tools.ask_user import AskUserTool
 
 from .config_validator import Protocols
+from aicocode.memory import MemoryManager
+from aicocode.memory.auto_dream import MemoryAutoDreamer
 
 log = logging.getLogger(__name__)
 
+MAX_TOKENS_CEILING = 64000
+MAX_OUTPUT_TOKENS_RECOVERIES = 3
+MEMORY_EXTRACTION_INTERVAL = 1
 
 """
     AgentLoop
@@ -92,6 +97,7 @@ class Agent:
         max_iterations: int = 0,
         permission_validator: PermissionValidator | None = None,
         context_window: int = 200_000,
+        memory_manager: MemoryManager | None = None,
         instructions_content: str = "",
     ) -> None:
         self.client: LLMClient = client
@@ -114,6 +120,16 @@ class Agent:
         self.compact_breaker = CompactBreaker()
         self.recovery_state: RecoveryState = RecoveryState()
         self.session_id: str = ""
+        self.memory_manager = memory_manager
+        self.instructions_content = instructions_content
+        self.file_history: Any = None
+        self.memory_recall_task: Any | None = None
+        self._memory_recall_consumed: bool = False
+        self._extracting = False
+        self._pending_extraction = False
+        self._auto_dreamer: MemoryAutoDreamer | None = None
+        if memory_manager is not None:
+            self._auto_dreamer = MemoryAutoDreamer(work_dir)
 
     @property
     def _transcript_path(self) -> str:
@@ -311,7 +327,42 @@ class Agent:
             return
         logging.info(f"Snapshot for: {path}")
         self.recovery_state.record_file_read(path, content)
-    
+
+
+    async def _extract_memories(
+        self, conversation: Conversation
+    ) -> None:
+        """
+        触发记忆提取，
+        当提取正在进行时，新的触发不会启动并发提取，而是标记 _pending_extraction。当前提取完成后检查该标志，
+        如果有 pending 则立即执行一次尾随提取，防止多个触发器同时执行导致重复提取。
+        """
+        if not self.memory_manager:
+            return
+
+        # 合并策略：正在提取时暂存新请求，等当前提取完成后尾随执行
+        if self._extracting:
+            log.debug("[extractMemories] extraction in progress — stashing for trailing run")
+            self._pending_extraction = True
+            return
+
+        self._extracting = True
+        try:
+            await self.memory_manager.extract(
+                self.client, conversation, self.protocol
+            )
+        except Exception as e:
+            log.debug("Memory extraction failed: %s", e)
+        finally:
+            self._extracting = False
+            # 检查是否有尾随提取请求
+            if self._pending_extraction:
+                self._pending_extraction = False
+                log.debug("[extractMemories] running trailing extraction for stashed context")
+                # 递归调用自身处理尾随请求
+                await self._extract_memories(conversation)
+
+
     def set_permission_mode(self, permission_mode: PermissionMode) -> None:
         self.permission_mode = permission_mode
         if self.permission_validator:
@@ -346,6 +397,9 @@ class Agent:
         env_context = build_environment_context(self.work_dir)
         conversation.inject_environment_context(env_context)
 
+        memory_content = self.memory_manager.load() if self.memory_manager else ""
+        conversation.inject_long_term_memory(self.instructions_content, memory_content)
+
         iteration = 0
         consecutive_unknown = 0
         max_tokens_escalated = False
@@ -353,7 +407,13 @@ class Agent:
 
         while True:
             iteration += 1
-            
+
+            if self.max_iterations > 0 and iteration > self.max_iterations:
+                yield ErrorEvent(
+                    message=f"Agent reached maximum iterations ({self.max_iterations})"
+                )
+                break
+
             system = build_system_prompt()
 
             if self.in_plan_mode:
@@ -402,6 +462,11 @@ class Agent:
                     boundary=compact_result.boundary,
                 )
                 conversation.inject_environment_context(env_context)
+                mem = self.memory_manager.load() if self.memory_manager else ""
+                conversation.inject_long_term_memory(
+                    self.instructions_content, mem
+                )
+
                 apply_tool_result_budget(
                     conversation, self.session_dir, self.replacement_state
                 )
@@ -443,12 +508,57 @@ class Agent:
                 for tb in response.thinking_blocks
             ]
 
+            if response.stop_reason == "max_tokens":
+                if not max_tokens_escalated:
+                    self.client.set_max_output_tokens(MAX_TOKENS_CEILING)
+                    max_tokens_escalated = True
+                    if response.text:
+                        conversation.add_assistant_message(
+                            response.text, thinking_blocks=conv_thinking
+                        )
+                        conversation.add_user_message(
+                            "Output token limit hit. Resume directly from where you stopped. "
+                            "Do not apologize or repeat previous content. Pick up mid-thought if needed."
+                        )
+                    yield RetryEvent(reason="max_tokens escalation")
+                    continue
+                elif output_recoveries < MAX_OUTPUT_TOKENS_RECOVERIES:
+                    output_recoveries += 1
+                    conversation.add_assistant_message(
+                        response.text, thinking_blocks=conv_thinking
+                    )
+                    conversation.add_user_message(
+                        "Output token limit hit. Resume directly from where you stopped. "
+                        "Break remaining work into smaller pieces."
+                    )
+                    yield RetryEvent(
+                        reason=f"max_tokens recovery {output_recoveries}/{MAX_OUTPUT_TOKENS_RECOVERIES}"
+                    )
+                    continue
+            else:
+                output_recoveries = 0
+
             if not response.tool_calls:
                 conversation.add_assistant_message(
                     response.text, thinking_blocks=conv_thinking
                 )
 
                 self._loop_count += 1
+
+                if (
+                    self._loop_count % MEMORY_EXTRACTION_INTERVAL == 0
+                    and self.memory_manager
+                ):
+                    asyncio.ensure_future(self._extract_memories(conversation))
+                    
+                if self._auto_dreamer is not None:
+                    asyncio.ensure_future(
+                        self._auto_dreamer.maybe_run(self.client, conversation, self.protocol)
+                    )
+
+                if self.file_history is not None:
+                    summary = response.text[:60] + "..." if len(response.text) > 60 else response.text
+                    self.file_history.make_snapshot(len(conversation.messages), summary)
 
                 yield LoopComplete(total_turns=iteration)
                 break
@@ -556,6 +666,16 @@ class Agent:
             )
 
             conversation.add_tool_results_message(tool_results)
+
+            if self.memory_recall_task and not self._memory_recall_consumed:
+                if self.memory_recall_task.done():
+                    try:
+                        recall = self.memory_recall_task.result()
+                        if recall:
+                            conversation.add_system_reminder(recall)
+                    except Exception:
+                        pass
+                    self._memory_recall_consumed = True
 
             if exit_plan_called:
                 yield TurnComplete(turn=iteration)

@@ -73,7 +73,7 @@ class ToolSearchTool(Tool):
 
         for schema in schemas:
             if "name" in schema:
-                self._registry.mark_discovered(schema["name"])
+                self._registry.mark_discovered_tools(schema["name"])
 
         return ToolResult(
             output=(
