@@ -90,6 +90,14 @@ from aicocode.memory import(
     render_reminder,
 )
 
+from aicocode.commands import (
+    CommandContext,
+    CommandRegistry,
+    complete,
+    parse_command,
+)
+from aicocode.commands.handlers import register_all_commands
+
 import re
 
 logger = logging.getLogger(__name__)
@@ -574,6 +582,8 @@ class CodeApp(App):
         self.memory_manager: MemoryManager | None = None
         self.session_manager: SessionManager | None = None
         self.session: Session | None = None
+        self.command_registry = CommandRegistry()
+        register_all_commands(self.command_registry)
 
     @staticmethod
     def _make_banner(model: str = "", work_dir: str = "") -> RichText:
@@ -927,10 +937,40 @@ class CodeApp(App):
         await self._dispatch_command_or_input(text)
 
     async def _dispatch_command_or_input(self, text: str) -> None:
-        if self._streaming:
+        name, args, is_command = parse_command(text)
+
+        if not is_command:
+            if self._streaming or self.agent is None:
+                return
+            self._agent_task = asyncio.create_task(self._send_message(text))
             return
-        self._agent_task = asyncio.create_task(self._send_message(text))
-        return
+
+        if name == "":
+            commands = self.command_registry.list_commands()
+            lines = ["可用命令："]
+            for cmd in commands:
+                aliases_str = ", ".join(f"/{a}" for a in cmd.aliases)
+                name_part = f"/{cmd.name}"
+                if aliases_str:
+                    name_part += f", {aliases_str}"
+                lines.append(f"  {name_part:<24} {cmd.description}")
+            self._show_system_message("\n".join(lines))
+            return
+
+        cmd = self.command_registry.find(name)
+        if cmd is None:
+            self._show_system_message(f"未知命令：/{name}，输入 /help 查看可用命令")
+            return
+
+        if not args and cmd.arg_prompt:
+            self._show_system_message(cmd.arg_prompt)
+            return
+
+        ctx = self._build_command_context(args)
+        try:
+            await cmd.handler(ctx)
+        except Exception as e:
+            self._show_error(f"命令执行失败: {e}")
 
 
     async def _prefetch_relevant_memories(self, query: str) -> str:
@@ -1459,3 +1499,105 @@ class CodeApp(App):
                 )
         except Exception:
             pass
+
+
+    def _build_command_context(self, args: str) -> CommandContext:
+        return CommandContext(
+            args=args,
+            agent=self.agent,
+            conversation=self.conversation,
+            session=self.session,
+            session_manager=self.session_manager,
+            memory_manager=self.memory_manager,
+            ui=self,
+            config={
+                "registry": self.command_registry,
+                "set_session": self._set_session,
+                "set_conversation": self._set_conversation,
+                "clear_chat": self._clear_chat,
+                "render_restored": self._render_restored_messages,
+            },
+        )
+
+    
+    def set_plan_mode(self, enabled: bool) -> None:
+        if self.agent is None:
+            return
+        if enabled:
+            self._pre_plan_mode = self.agent.permission_mode
+            self.agent.set_permission_mode(PermissionMode.PLAN)
+        else:
+            restore = getattr(self, "_pre_plan_mode", PermissionMode.DEFAULT)
+            self.agent.set_permission_mode(restore)
+        self._update_mode_label()
+
+    def _set_conversation(self, conv: Conversation) -> None:
+        self.conversation = conv
+
+    def refresh_status(self) -> None:
+        self._update_mode_label()
+
+    def _clear_chat(self) -> None:
+        chat = self.query_one("#chat-area", VerticalScroll)
+        chat.remove_children()
+
+    def _set_session(self, session: Session) -> None:
+        self.session = session
+        if self.agent:
+            self.agent.session_id = session.session_id
+
+    async def _render_restored_messages(self, messages: list[Message]) -> None:
+        chat = self.query_one("#chat-area", VerticalScroll)
+        await chat.remove_children()
+
+        for msg in messages:
+            if msg.tool_results or not msg.content:
+                continue
+            if msg.role == "user":
+                row = Vertical(classes="user-row")
+                await chat.mount(row)
+                user_rich = RichText()
+                user_rich.append("❯ ", style="bold color(80)")
+                user_rich.append(msg.content, style="bold color(255)")
+                bubble = Static(user_rich, classes="message user-message")
+                await row.mount(bubble)
+            elif msg.role == "assistant":
+                row = Vertical(classes="ai-row")
+                await chat.mount(row)
+                md = Markdown(msg.content, classes="message ai-message")
+                await row.mount(md)
+
+        self.call_after_refresh(chat.scroll_end, animate=False)
+        
+    
+    def get_token_count(self) -> tuple[int, int]:
+        if self.agent:
+            return self.agent.total_input_tokens, self.agent.total_output_tokens
+        return 0, 0
+    
+    def add_system_message(self, text: str) -> None:
+        self._show_system_message(text)
+
+
+    def on_chat_input_tab_complete(self, event: ChatInput.TabComplete) -> None:
+        matches = complete(self.command_registry, event.text)
+        if not matches:
+            return
+        popup = self.query_one(CompletionPopup)
+        if len(matches) == 1:
+            input_widget = self.query_one("#chat-input", ChatInput)
+            input_widget.clear()
+            input_widget.insert(matches[0][1] + " ")
+        else:
+            popup.show_pairs(matches)
+
+    def on_chat_input_slash_menu_update(self, event: ChatInput.SlashMenuUpdate) -> None:
+        popup = self.query_one(CompletionPopup)
+        if event.prefix is None:
+            popup.hide()
+            return
+        matches = complete(self.command_registry, event.prefix)
+        if not matches:
+            popup.hide()
+            return
+        popup.show_pairs(matches)

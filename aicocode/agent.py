@@ -711,3 +711,35 @@ class Agent:
         # if len(text) > MAX_OUTPUT_CHARS:
         #     return text[:MAX_OUTPUT_CHARS] + "\n… (output truncated)"
         return text
+
+    async def manual_compact(
+        self, conversation: Conversation
+    ) -> CompactNotification | ErrorEvent:
+        """
+        /compact 命令处理逻辑
+        """
+        result = await auto_compact(
+            conversation=conversation,
+            client=self.client,
+            context_window=self.context_window,
+            session_dir=self.session_dir,
+            protocol=self.protocol,
+            manual=True,
+            breaker=self.compact_breaker,
+            recovery=self.recovery_state,
+            tool_schemas=self.registry.get_all_schemas(self.protocol),
+            transcript_path=self._transcript_path,
+        )
+        if isinstance(result, CompactEvent):
+            env_context = build_environment_context(self.work_dir)
+            conversation.inject_environment_context(env_context)
+            memory_content = self.memory_manager.load() if self.memory_manager else ""
+            conversation.inject_long_term_memory(
+                self.instructions_content, memory_content
+            )
+            return CompactNotification(
+                before_tokens=result.before_tokens,
+                message=f"上下文已压缩（压缩前 {result.before_tokens:,} tokens）",
+                boundary=result.boundary,
+            )
+        return ErrorEvent(message=result or "压缩失败：对话历史为空或未达到压缩条件")
