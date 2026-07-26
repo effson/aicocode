@@ -12,6 +12,7 @@ from pathlib import Path
 
 from aicocode.config import ConfigError, load_config
 from aicocode.Permissions import PermissionMode
+from aicocode.hooks import HookConfigError, HookEngine, load_hooks
 
 def main() -> None:
     Path(".aicocode").mkdir(parents=True, exist_ok=True)
@@ -41,6 +42,14 @@ def main() -> None:
     mode_str = args.permissionmode if args.permissionmode else config.permission_mode
     permission_mode = PermissionMode(mode_str)
 
+    try:
+        hooks = load_hooks(config.raw_hooks)
+    except HookConfigError as e:
+        print(f"Hook config error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    hook_engine = HookEngine(hooks) if hooks else None
+
     from aicocode.app import CodeApp
     from aicocode.driver import NoAltScreenDriver
 
@@ -50,5 +59,6 @@ def main() -> None:
         driver_class=NoAltScreenDriver,
         sandbox_config=config.sandbox,
         mcp_servers=config.mcp_servers,
+        hook_engine=hook_engine,
     )
     app.run()

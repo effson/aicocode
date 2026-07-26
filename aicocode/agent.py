@@ -36,7 +36,8 @@ from aicocode.agent_event import (
     PermissionResponse,
     PermissionRequest,
     AskUserRequest,
-    CompactNotification
+    CompactNotification,
+    HookEvent
 )
 
 from aicocode.prompt import build_environment_context, build_system_prompt, build_plan_mode_reminder
@@ -77,6 +78,7 @@ from aicocode.tools.ask_user import AskUserTool
 from .config_validator import Protocols
 from aicocode.memory import MemoryManager
 from aicocode.memory.auto_dream import MemoryAutoDreamer
+from aicocode.hooks import HookEngine, HookContext
 
 log = logging.getLogger(__name__)
 
@@ -99,6 +101,7 @@ class Agent:
         context_window: int = 200_000,
         memory_manager: MemoryManager | None = None,
         instructions_content: str = "",
+        hook_engine: HookEngine | None = None,
     ) -> None:
         self.client: LLMClient = client
         self.registry = registry
@@ -132,6 +135,7 @@ class Agent:
             self._auto_dreamer = MemoryAutoDreamer(work_dir)
         self._skill_catalog: str = ""
         self.active_skills: dict[str, str] = {}
+        self.hook_engine = hook_engine
 
     @property
     def _transcript_path(self) -> str:
@@ -402,6 +406,12 @@ class Agent:
         memory_content = self.memory_manager.load() if self.memory_manager else ""
         conversation.inject_long_term_memory(self.instructions_content, memory_content)
 
+        if self.hook_engine:
+            ctx = self._build_hook_context("session_start")
+            await self.hook_engine.run_hooks("session_start", ctx)
+            for hook_event in self._drain_hook_events():
+                yield hook_event
+
         iteration = 0
         consecutive_unknown = 0
         max_tokens_escalated = False
@@ -415,8 +425,24 @@ class Agent:
                     message=f"Agent reached maximum iterations ({self.max_iterations})"
                 )
                 break
+            
+            if self.hook_engine:
+                ctx = self._build_hook_context("turn_start")
+                await self.hook_engine.run_hooks("turn_start", ctx)
+                for hook_event in self._drain_hook_events():
+                    yield hook_event
 
-            system = build_system_prompt()
+            if self.hook_engine:
+                ctx = self._build_hook_context("pre_send")
+                await self.hook_engine.run_hooks("pre_send", ctx)
+                for hook_event in self._drain_hook_events():
+                    yield hook_event
+
+            hook_prompts = (
+                self.hook_engine.get_prompt_messages() if self.hook_engine else None
+            )
+
+            system = build_system_prompt(hook_prompts=hook_prompts)
 
             if self.in_plan_mode:
                 plan_file_path = str(self._get_plan_path())
@@ -427,6 +453,12 @@ class Agent:
                     plan_file_path, plan_file_exists, iteration
                 )
                 conversation.add_system_reminder(plan_reminder)
+
+            if self.hook_engine:
+                for note in self.hook_engine.drain_notifications():
+                    conversation.add_system_reminder(
+                        f"Hook [{note.hook_id}] {note.event}: {note.output}"
+                    )
 
             deferred_names = self.registry.get_deferred_tool_names()
             if deferred_names:
@@ -498,6 +530,13 @@ class Agent:
                 yield event
 
             response = collector.response
+
+            if self.hook_engine:
+                ctx = self._build_hook_context("post_receive", message=response.text)
+                await self.hook_engine.run_hooks("post_receive", ctx)
+                for hook_event in self._drain_hook_events():
+                    yield hook_event
+
             self.total_input_tokens += response.input_tokens
             self.total_output_tokens += response.output_tokens
             yield UsageEvent(
@@ -557,6 +596,14 @@ class Agent:
                     asyncio.ensure_future(
                         self._auto_dreamer.maybe_run(self.client, conversation, self.protocol)
                     )
+
+                if self.hook_engine:
+                    ctx = self._build_hook_context("turn_end")
+                    await self.hook_engine.run_hooks("turn_end", ctx)
+                    ctx = self._build_hook_context("session_end")
+                    await self.hook_engine.run_hooks("session_end", ctx)
+                    for hook_evente in self._drain_hook_events():
+                        yield hook_evente
 
                 if self.file_history is not None:
                     summary = response.text[:60] + "..." if len(response.text) > 60 else response.text
@@ -684,6 +731,12 @@ class Agent:
                 yield LoopComplete(total_turns=iteration)
                 break
 
+            if self.hook_engine:
+                ctx = self._build_hook_context("turn_end")
+                await self.hook_engine.run_hooks("turn_end", ctx)
+                for hook_event in self._drain_hook_events():
+                    yield hook_event
+
             yield TurnComplete(turn=iteration)
 
     def _maybe_persist_or_truncate(
@@ -755,3 +808,28 @@ class Agent:
 
     def clear_active_skills(self) -> None:
         self.active_skills.clear()
+
+
+    def _build_hook_context(self, event: str, **kwargs: str | dict) -> HookContext:
+        return HookContext(
+            event_name=event,
+            tool_name=str(kwargs.get("tool_name", "")),
+            tool_args=kwargs.get("tool_args", {}),
+            file_path=str(kwargs.get("file_path", "")),
+            message=str(kwargs.get("message", "")),
+            error=str(kwargs.get("error", "")),
+        )
+
+
+    def _drain_hook_events(self) -> list[HookEvent]:
+        if not self.hook_engine:
+            return []
+        return [
+            HookEvent(
+                hook_id=n.hook_id,
+                event=n.event,
+                output=n.output,
+                success=n.success,
+            )
+            for n in self.hook_engine.drain_notifications()
+        ]

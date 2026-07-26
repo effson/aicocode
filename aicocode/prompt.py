@@ -310,6 +310,7 @@ def build_plan_mode_reminder(
 def build_system_prompt(
     custom_instructions: str = "",
     work_dir: str = ".",
+    hook_prompts: list[str] | None = None,
 ) -> str:
 
     builder = PromptConstructer()
@@ -330,6 +331,9 @@ def build_system_prompt(
         ))
 
     result = builder.build()
+
+    if hook_prompts:
+        result += "\n\n# Hook Injected Context\n" + "\n".join(hook_prompts)
 
     return result
 

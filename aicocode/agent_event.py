@@ -111,6 +111,14 @@ class CompactNotification:
     # 失败路径下为 None。
     boundary: "CompactBoundary | None" = None
 
+
+@dataclass
+class HookEvent:
+    hook_id: str
+    event: str
+    output: str
+    success: bool
+
 AgentEvent = (
     StreamText
     | ThinkingText
@@ -124,6 +132,7 @@ AgentEvent = (
     | PermissionRequest
     | AskUserRequest
     | CompactNotification
+    | HookEvent
 )
 
 class StreamCollector:

@@ -145,6 +145,14 @@ def validate_mcp_servers(raw_mcp: list | None) -> list[dict]:
 
     return servers
 
+def validate_hooks(raw_hooks: list | None) -> list:
+    """校验 hooks 配置段。"""
+    if raw_hooks is None:
+        return []
+    if not isinstance(raw_hooks, list):
+        raise ConfigError("'hooks' must be a list of hook definitions")
+    return raw_hooks
+
 """
     模型配置
 """
@@ -194,4 +202,5 @@ def validate_config(raw: object) -> dict:
         "permission_mode": validate_permission_mode(raw.get("permission_mode", "default")),
         "sandbox": validate_sandbox(raw.get("sandbox")),
         "mcp_servers": validate_mcp_servers(raw.get("mcp_servers")),
+        "hooks": validate_hooks(raw.get("hooks")),
     }

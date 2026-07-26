@@ -132,6 +132,7 @@ class AppConfig:
     permission_mode: str = "default"
     sandbox: SandboxAppConfig = field(default_factory=SandboxAppConfig)
     mcp_servers: list[MCPServerConfig] = field(default_factory=list)
+    raw_hooks: list[dict] = field(default_factory=list)
 
 def _load_config_yaml(path: Path) -> AppConfig:
     try:
@@ -179,6 +180,7 @@ def _load_config_yaml(path: Path) -> AppConfig:
         permission_mode=validated_config["permission_mode"],
         sandbox=sandbox_cfg,
         mcp_servers=mcp_servers,
+        raw_hooks=validated_config["hooks"],
     )
 
 def _merge_existing_config(base: AppConfig, override: AppConfig) -> AppConfig:
@@ -194,7 +196,7 @@ def _merge_existing_config(base: AppConfig, override: AppConfig) -> AppConfig:
             else:
                 base.mcp_servers.append(s)
                 by_name[s.name] = len(base.mcp_servers) - 1
-
+    base.raw_hooks.extend(override.raw_hooks)
     if override.sandbox.enabled:
         base.sandbox.enabled = True
     if override.sandbox.auto_allow:

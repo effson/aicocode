@@ -49,6 +49,7 @@ from aicocode.agent_event import (
     PermissionRequest,
     AskUserRequest,
     CompactNotification,
+    HookEvent,
 )
 
 from aicocode.llm_client import (
@@ -103,6 +104,7 @@ from aicocode.tools.load_skill import LoadSkill
 from aicocode.skills.executor import SkillExecutor
 from aicocode.skills.loader import SkillLoader
 from aicocode.commands.handlers.register_skill import register_skill_commands
+from aicocode.hooks import HookEngine, HookContext
 
 import re
 
@@ -557,6 +559,7 @@ class CodeApp(App):
         driver_class: type | None = None,
         sandbox_config: Any = None,
         mcp_servers: list[MCPServerConfig] | None = None,
+        hook_engine: HookEngine | None = None,
     ) -> None:
         super().__init__(driver_class=driver_class)
         self.providers = providers
@@ -593,6 +596,7 @@ class CodeApp(App):
         self.skill_loader: SkillLoader | None = None
         self.skill_executor: SkillExecutor | None = None
         self._load_skill_tool: LoadSkill | None = None
+        self.hook_engine = hook_engine
 
 
     @staticmethod
@@ -700,6 +704,7 @@ class CodeApp(App):
             context_window=provider.get_context_window(),
             memory_manager=self.memory_manager,
             instructions_content=self._instructions_content,
+            hook_engine=self.hook_engine,
         )
 
         self.agent.file_history = self.file_history
@@ -739,7 +744,7 @@ class CodeApp(App):
             lines.append(
                 "If the user's request matches a Skill, call LoadSkill to activate it."
             )
-            self.agent.set_skill_catalog(catalog)
+            self.agent.set_skill_catalog("\n".join(lines))
 
         register_skill_commands(
             self.command_registry, self.skill_loader, self.skill_executor
@@ -751,6 +756,13 @@ class CodeApp(App):
             )
 
         install_skill_tool.set_on_installed(_on_skill_installed)
+
+        if self.hook_engine:
+            asyncio.ensure_future(
+                self.hook_engine.run_hooks(
+                    "startup", HookContext(event_name="startup")
+                )
+            )
 
         if self._mcp_server_configs:
             self._mcp_init_task = asyncio.create_task(self._init_mcp())
@@ -892,6 +904,13 @@ class CodeApp(App):
             if self.agent and self.agent.memory_manager:
                 tasks.append(asyncio.create_task(
                     self.agent._extract_memories(self.conversation)
+                ))
+
+            if self.hook_engine:
+                tasks.append(asyncio.create_task(
+                    self.hook_engine.run_hooks(
+                        "shutdown", HookContext(event_name="shutdown")
+                    )
                 ))
 
             tasks.append(asyncio.create_task(self._shutdown_mcp()))
@@ -1247,6 +1266,12 @@ class CodeApp(App):
                         streaming_label = None
                         accumulated_text = ""
                     self._show_error(event.message)
+
+                elif isinstance(event, HookEvent):
+                    status = "✓" if event.success else "✗"
+                    self._show_system_message(
+                        f"Hook [{event.hook_id}] {status} {event.output}"
+                    )
 
                 elif isinstance(event, LoopComplete):
                     total_time = _time.monotonic() - self._thinking_start
@@ -1672,6 +1697,7 @@ class CodeApp(App):
             return
         if not self.skill_loader.needs_reload():
             return
+        logger.info("refreshing skills...")
         self.skill_loader.reload()
         if self.command_registry is not None:
             register_skill_commands(
