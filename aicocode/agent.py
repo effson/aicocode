@@ -130,6 +130,8 @@ class Agent:
         self._auto_dreamer: MemoryAutoDreamer | None = None
         if memory_manager is not None:
             self._auto_dreamer = MemoryAutoDreamer(work_dir)
+        self._skill_catalog: str = ""
+        self.active_skills: dict[str, str] = {}
 
     @property
     def _transcript_path(self) -> str:
@@ -394,7 +396,7 @@ class Agent:
 
     async def run(self, conversation: Conversation) -> AsyncIterator[AgentEvent]:
         self._current_conversation = conversation
-        env_context = build_environment_context(self.work_dir)
+        env_context = build_environment_context(self.work_dir,self._skill_catalog)
         conversation.inject_environment_context(env_context)
 
         memory_content = self.memory_manager.load() if self.memory_manager else ""
@@ -731,7 +733,7 @@ class Agent:
             transcript_path=self._transcript_path,
         )
         if isinstance(result, CompactEvent):
-            env_context = build_environment_context(self.work_dir)
+            env_context = build_environment_context(self.work_dir, self._skill_catalog)
             conversation.inject_environment_context(env_context)
             memory_content = self.memory_manager.load() if self.memory_manager else ""
             conversation.inject_long_term_memory(
@@ -743,3 +745,13 @@ class Agent:
                 boundary=result.boundary,
             )
         return ErrorEvent(message=result or "压缩失败：对话历史为空或未达到压缩条件")
+    
+    
+    def set_skill_catalog(self, catalog: str) -> None:
+        self._skill_catalog = catalog
+
+    def activate_skill(self, name: str, prompt_body: str) -> None:
+        self.active_skills[name] = prompt_body
+
+    def clear_active_skills(self) -> None:
+        self.active_skills.clear()

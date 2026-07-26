@@ -390,12 +390,22 @@ def build_compact_messages(
 
 RECOVERY_FILE_LIMIT = 5
 RECOVERY_TOKENS_PER_FILE = 5_000
+RECOVERY_SKILLS_BUDGET = 25_000
+RECOVERY_TOKENS_PER_SKILL = 5_000
 
 @dataclass
 class FileReadRecord:
     path: str
     content: str
     timestamp: float
+
+
+@dataclass
+class SkillInvocationRecord:
+    name: str
+    body: str
+    timestamp: float
+
 
 class RecoveryState:
     """
@@ -405,6 +415,7 @@ class RecoveryState:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._files: dict[str, FileReadRecord] = {}
+        self._skills: dict[str, SkillInvocationRecord] = {}
 
     def record_file_read(self, path: str, content: str) -> None:
         if not path:
@@ -420,6 +431,20 @@ class RecoveryState:
         records.sort(key=lambda r: r.timestamp, reverse=True)
         if limit > 0:
             records = records[:limit]
+        return records
+
+    def record_skill_invocation(self, name: str, body: str) -> None:
+        if not name:
+            return
+        with self._lock:
+            self._skills[name] = SkillInvocationRecord(
+                name=name, body=body, timestamp=time.time()
+            )
+
+    def snapshot_skills(self) -> list[SkillInvocationRecord]:
+        with self._lock:
+            records = list(self._skills.values())
+        records.sort(key=lambda r: r.timestamp, reverse=True)
         return records
 
 def _approx_tokens(s: str) -> int:
@@ -471,6 +496,23 @@ def build_recovery_attachment(
                     buf.append("\n")
                 buf.append("```\n")
             sections.append("".join(buf))
+
+        skills = state.snapshot_skills()
+        if skills:
+            buf = ["## 已激活的技能\n",
+                   "下列技能在本会话中被调用过，其触发条件仍然适用。\n"]
+            used = 0
+            emitted = False
+            for sk in skills:
+                body = _truncate_by_tokens(sk.body, RECOVERY_TOKENS_PER_SKILL)
+                tokens = _approx_tokens(body) + _approx_tokens(sk.name) + 8
+                if used + tokens > RECOVERY_SKILLS_BUDGET:
+                    break
+                used += tokens
+                buf.append(f"### {sk.name}\n\n{body}\n")
+                emitted = True
+            if emitted:
+                sections.append("".join(buf))
 
     if tool_schemas:
         buf = ["## 可用工具\n",

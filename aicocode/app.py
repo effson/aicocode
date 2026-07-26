@@ -98,6 +98,12 @@ from aicocode.commands import (
 )
 from aicocode.commands.handlers import register_all_commands
 
+from aicocode.tools.install_skill import InstallSkillTool
+from aicocode.tools.load_skill import LoadSkill
+from aicocode.skills.executor import SkillExecutor
+from aicocode.skills.loader import SkillLoader
+from aicocode.commands.handlers.register_skill import register_skill_commands
+
 import re
 
 logger = logging.getLogger(__name__)
@@ -584,6 +590,10 @@ class CodeApp(App):
         self.session: Session | None = None
         self.command_registry = CommandRegistry()
         register_all_commands(self.command_registry)
+        self.skill_loader: SkillLoader | None = None
+        self.skill_executor: SkillExecutor | None = None
+        self._load_skill_tool: LoadSkill | None = None
+
 
     @staticmethod
     def _make_banner(model: str = "", work_dir: str = "") -> RichText:
@@ -673,6 +683,14 @@ class CodeApp(App):
         self._exit_plan_tool = ExitPlanModeTool()
         self.registry.register_tool(self._exit_plan_tool)
 
+        load_skill_tool = LoadSkill()
+        self.registry.register_tool(load_skill_tool)
+        self._load_skill_tool = load_skill_tool
+
+        install_skill_tool = InstallSkillTool()
+        self.registry.register_tool(install_skill_tool)
+        self._install_skill_tool = install_skill_tool
+
         self.agent = Agent(
             client=self.client,
             registry=self.registry,
@@ -693,6 +711,46 @@ class CodeApp(App):
         self.run_worker(
             self._resolve_context_window(provider), exclusive=False
         )
+
+        self.skill_loader = SkillLoader(work_dir)
+        self.skill_loader.load_all()
+
+        load_skill_tool.set_loader(self.skill_loader)
+        load_skill_tool.set_agent(self.agent)
+
+        install_skill_tool.set_loader(self.skill_loader)
+
+        self.skill_executor = SkillExecutor(
+            agent=self.agent,
+            conversation=self.conversation,
+            client=self.client,
+            protocol=provider.protocol,
+        )
+
+        catalog = self.skill_loader.get_catalog()
+        if catalog:
+            lines = [
+                "You can use the following Skills:",
+                "",
+            ]
+            for name, desc in catalog:
+                lines.append(f"- {name}: {desc}")
+            lines.append("")
+            lines.append(
+                "If the user's request matches a Skill, call LoadSkill to activate it."
+            )
+            self.agent.set_skill_catalog(catalog)
+
+        register_skill_commands(
+            self.command_registry, self.skill_loader, self.skill_executor
+        )
+
+        def _on_skill_installed(name: str) -> None:
+            register_skill_commands(
+                self.command_registry, self.skill_loader, self.skill_executor
+            )
+
+        install_skill_tool.set_on_installed(_on_skill_installed)
 
         if self._mcp_server_configs:
             self._mcp_init_task = asyncio.create_task(self._init_mcp())
@@ -1017,6 +1075,9 @@ class CodeApp(App):
 
 
     async def _send_message(self, text: str, is_notification: bool = False) -> None:
+        assert self.agent is not None
+        self._refresh_skills_if_needed()
+
         if self._mcp_init_task and not self._mcp_init_task.done():
             self._show_system_message("Waiting for MCP servers to connect...")
             await self._mcp_init_task
@@ -1516,6 +1577,8 @@ class CodeApp(App):
                 "set_conversation": self._set_conversation,
                 "clear_chat": self._clear_chat,
                 "render_restored": self._render_restored_messages,
+                "skill_loader": self.skill_loader,
+                "skill_executor": self.skill_executor,
             },
         )
 
@@ -1601,3 +1664,28 @@ class CodeApp(App):
             popup.hide()
             return
         popup.show_pairs(matches)
+
+
+    def _refresh_skills_if_needed(self) -> None:
+        """每轮对话前检查 skill 目录 modtime(修改时间)，有变化自动 reload。"""
+        if self.skill_loader is None or self.agent is None:
+            return
+        if not self.skill_loader.needs_reload():
+            return
+        self.skill_loader.reload()
+        if self.command_registry is not None:
+            register_skill_commands(
+                self.command_registry, self.skill_loader, self.skill_executor
+            )
+        catalog = self.skill_loader.get_catalog()
+        if catalog:
+            lines = ["You can use the following Skills:", ""]
+            for name, desc in catalog:
+                lines.append(f"- {name}: {desc}")
+            lines.append("")
+            lines.append(
+                "If the user's request matches a Skill, call LoadSkill to activate it."
+            )
+            self.agent.set_skill_catalog("\n".join(lines))
+        else:
+            self.agent.set_skill_catalog("")

@@ -335,6 +335,7 @@ def build_system_prompt(
 
 def build_environment_context(
     work_dir: str,
+    skill_catalog: str = "",
 ) -> str:
     parts = [
         f"Current working directory: {work_dir}",
@@ -342,7 +343,8 @@ def build_environment_context(
         f"Current time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
     ]
 
-    # active_skills 不再注入 env context —— Skill 内容作为普通消息注入一次到对话历史，
-    # 随对话自然推远，auto-compact 时会被摘要。
+    if skill_catalog:
+        parts.append("")
+        parts.append(skill_catalog)
 
     return "\n".join(parts)

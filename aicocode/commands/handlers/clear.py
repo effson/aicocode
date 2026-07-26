@@ -24,7 +24,7 @@ async def handle_clear(ctx: CommandContext) -> None:
 
     if ctx.agent:
         ctx.agent._loop_count = 0
-        # ctx.agent.clear_active_skills()
+        ctx.agent.clear_active_skills()
         # 重置 token 计数
         ctx.agent.total_input_tokens = 0
         ctx.agent.total_output_tokens = 0
