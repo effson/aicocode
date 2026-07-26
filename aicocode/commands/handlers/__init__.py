@@ -10,6 +10,7 @@ from aicocode.commands.handlers.plan import PLAN_COMMAND
 from aicocode.commands.handlers.session import SESSION_COMMAND
 from aicocode.commands.handlers.rewind import REWIND_COMMAND
 from aicocode.commands.handlers.status import STATUS_COMMAND
+from aicocode.commands.handlers.skill import SKILL_COMMAND
 from aicocode.commands.registry import CommandRegistry
 
 
@@ -24,6 +25,7 @@ ALL_COMMANDS = [
     PERMISSION_COMMAND,
     REWIND_COMMAND,
     STATUS_COMMAND,
+    SKILL_COMMAND,
 ]
 
 
