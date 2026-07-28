@@ -153,6 +153,12 @@ def validate_hooks(raw_hooks: list | None) -> list:
         raise ConfigError("'hooks' must be a list of hook definitions")
     return raw_hooks
 
+def validate_bool_field(value: object, field_name: str) -> bool:
+    """校验一个布尔类型的配置字段。"""
+    if not isinstance(value, bool):
+        raise ConfigError(f"'{field_name}' must be a boolean")
+    return value
+
 """
     模型配置
 """
@@ -188,7 +194,8 @@ def lookup_model_context_window(model: str) -> int:
 """
 校验的主入口。校验解析后的原始配置，返回清洗后的字典。
 返回的字典目前包含以下键：
-providers permission_mode sandbox mcp_servers
+providers permission_mode sandbox mcp_servers hooks enable_verification_agent
+enable_fork
 """
 def validate_config(raw: object) -> dict:
     """
@@ -203,4 +210,8 @@ def validate_config(raw: object) -> dict:
         "sandbox": validate_sandbox(raw.get("sandbox")),
         "mcp_servers": validate_mcp_servers(raw.get("mcp_servers")),
         "hooks": validate_hooks(raw.get("hooks")),
+        "enable_verification_agent": validate_bool_field(
+            raw.get("enable_verification_agent", False), "enable_verification_agent"
+        ),
+        "enable_fork": validate_bool_field(raw.get("enable_fork", False), "enable_fork"),
     }

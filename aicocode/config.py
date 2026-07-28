@@ -133,6 +133,8 @@ class AppConfig:
     sandbox: SandboxAppConfig = field(default_factory=SandboxAppConfig)
     mcp_servers: list[MCPServerConfig] = field(default_factory=list)
     raw_hooks: list[dict] = field(default_factory=list)
+    enable_fork: bool = False
+    enable_verification_agent: bool = False
 
 def _load_config_yaml(path: Path) -> AppConfig:
     try:
@@ -181,6 +183,8 @@ def _load_config_yaml(path: Path) -> AppConfig:
         sandbox=sandbox_cfg,
         mcp_servers=mcp_servers,
         raw_hooks=validated_config["hooks"],
+        enable_fork=validated_config["enable_fork"],
+        enable_verification_agent=validated_config["enable_verification_agent"],
     )
 
 def _merge_existing_config(base: AppConfig, override: AppConfig) -> AppConfig:
@@ -203,6 +207,10 @@ def _merge_existing_config(base: AppConfig, override: AppConfig) -> AppConfig:
         base.sandbox.auto_allow = True
     if override.sandbox.network_enabled:
         base.sandbox.network_enabled = True
+    if override.enable_fork:
+        base.enable_fork = True
+    if override.enable_verification_agent:
+        base.enable_verification_agent = True
     return base
 
 

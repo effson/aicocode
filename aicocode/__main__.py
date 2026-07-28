@@ -60,5 +60,7 @@ def main() -> None:
         sandbox_config=config.sandbox,
         mcp_servers=config.mcp_servers,
         hook_engine=hook_engine,
+        enable_fork=config.enable_fork,
+        enable_verification_agent=config.enable_verification_agent,
     )
     app.run()

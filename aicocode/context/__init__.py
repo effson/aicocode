@@ -17,6 +17,7 @@ from aicocode.context.manager import (
     compute_compact_threshold,
     create_replacement_state,
     ensure_session_dir,
+    clone_replacement_state,
 )
 
 
@@ -39,4 +40,5 @@ __all__ = [
     "compute_compact_threshold",
     "create_replacement_state",
     "ensure_session_dir",
+    "clone_replacement_state",
 ]

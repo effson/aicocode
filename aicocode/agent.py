@@ -136,6 +136,9 @@ class Agent:
         self._skill_catalog: str = ""
         self.active_skills: dict[str, str] = {}
         self.hook_engine = hook_engine
+        self.trace_id: str | None = None
+        self._agent_catalog: str = ""
+        self._agent_catalog_list: list[tuple[str, str]] = []
 
     @property
     def _transcript_path(self) -> str:
@@ -400,7 +403,9 @@ class Agent:
 
     async def run(self, conversation: Conversation) -> AsyncIterator[AgentEvent]:
         self._current_conversation = conversation
-        env_context = build_environment_context(self.work_dir,self._skill_catalog)
+        env_context = build_environment_context(
+            self.work_dir,self._skill_catalog, self._agent_catalog
+        )
         conversation.inject_environment_context(env_context)
 
         memory_content = self.memory_manager.load() if self.memory_manager else ""
@@ -442,7 +447,10 @@ class Agent:
                 self.hook_engine.get_prompt_messages() if self.hook_engine else None
             )
 
-            system = build_system_prompt(hook_prompts=hook_prompts)
+            system = build_system_prompt(
+                hook_prompts=hook_prompts,
+                agent_catalog=self._agent_catalog_list or None,
+            )
 
             if self.in_plan_mode:
                 plan_file_path = str(self._get_plan_path())
@@ -786,7 +794,9 @@ class Agent:
             transcript_path=self._transcript_path,
         )
         if isinstance(result, CompactEvent):
-            env_context = build_environment_context(self.work_dir, self._skill_catalog)
+            env_context = build_environment_context(
+                self.work_dir, self._skill_catalog, self._agent_catalog
+            )
             conversation.inject_environment_context(env_context)
             memory_content = self.memory_manager.load() if self.memory_manager else ""
             conversation.inject_long_term_memory(
@@ -833,3 +843,243 @@ class Agent:
             )
             for n in self.hook_engine.drain_notifications()
         ]
+
+    async def run_to_completion(
+            self, task: str, conversation: Conversation | None = None,
+            event_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> str:
+        if conversation is None:
+            conversation = Conversation()
+            env_context = build_environment_context(
+                self.work_dir, self._skill_catalog, self._agent_catalog
+            )
+            conversation.inject_environment_context(env_context)
+
+            if self.instructions_content:
+                memory_content = self.memory_manager.load() if self.memory_manager else ""
+                conversation.inject_long_term_memory(
+                    self.instructions_content, memory_content
+                )
+
+        if task:
+            conversation.add_user_message(task)
+
+        hook_prompts = (
+            self.hook_engine.get_prompt_messages() if self.hook_engine else None
+        )
+
+        system = build_system_prompt(hook_prompts=hook_prompts)
+        tools = self.registry.get_all_schemas(self.protocol)
+        log.info(
+            "[run_to_completion] agent=%s tools=%d names=%s",
+            self.agent_id,
+            len(tools),
+            [t["name"] for t in tools][:10],
+        )
+
+        last_text = ""
+
+        iteration = 0
+        while True:
+            iteration += 1
+            if self.max_iterations > 0 and iteration > self.max_iterations:
+                break
+
+            if self.hook_engine:
+                ctx = self._build_hook_context("turn_start")
+                await self.hook_engine.run_hooks("turn_start", ctx)
+
+            pre_compact_records = apply_tool_result_budget(
+                conversation, self.session_dir, self.replacement_state
+            )
+
+            compact_result = await auto_compact(
+                conversation=conversation,
+                client=self.client,
+                context_window=self.context_window,
+                session_dir=self.session_dir,
+                protocol=self.protocol,
+                breaker=self.compact_breaker,
+                recovery=self.recovery_state,
+                tool_schemas=self.registry.get_all_schemas(self.protocol),
+                transcript_path=self._transcript_path,
+            )
+            if isinstance(compact_result, CompactEvent):
+                conversation.inject_environment_context(env_context)
+
+            deferred_names = self.registry.get_deferred_tool_names()
+            if deferred_names:
+                conversation.add_system_reminder(
+                    "The following deferred tools are available via ToolSearch. "
+                    "Their schemas are NOT loaded - use ToolSearch with "
+                    'query "select:<name>[,<name>...]" to load tool schemas before calling them:\n'
+                    + "\n".join(deferred_names)
+                )
+
+            _new_records = apply_tool_result_budget(
+                conversation, self.session_dir, self.replacement_state
+            )
+            if _new_records:
+                append_replacement_records(self.session_dir, _new_records)
+
+            collector = StreamCollector()
+            llm_stream = self.client.stream(conversation, system=system, tools=tools)
+            async for _event in collector.consume(llm_stream):
+                pass
+
+            response = collector.response
+            self.total_input_tokens += response.input_tokens
+            self.total_output_tokens += response.output_tokens
+
+            if event_callback:
+                event_callback({
+                    "type": "usage",
+                    "usage": {
+                        "inputTokens": self.total_input_tokens,
+                        "outputTokens": self.total_output_tokens,
+                    },
+                })
+
+            if response.text:
+                last_text = response.text
+                if event_callback:
+                    event_callback({
+                        "type": "stream_text",
+                        "text": response.text,
+                    })
+
+            log.info(
+                "[run_to_completion] agent=%s iter=%d tool_calls=%d text_len=%d stop=%s",
+                self.agent_id, iteration, len(response.tool_calls),
+                len(response.text), response.stop_reason,
+            )
+
+            if not response.tool_calls:
+                conversation.add_assistant_message(response.text)
+                if self.file_history is not None:
+                    summary = response.text[:60] + "..." if len(response.text) > 60 else response.text
+                    self.file_history.make_snapshot(len(conversation.history), summary)
+                break
+
+            tool_uses = [
+                ToolUseBlock(
+                    tool_use_id=tc.tool_id,
+                    tool_name=tc.tool_name,
+                    arguments=tc.arguments,
+                )
+                for tc in response.tool_calls
+            ]
+            conversation.add_assistant_message(response.text, tool_uses)
+
+            conversation.record_usage_anchor(
+                response.input_tokens,
+                response.output_tokens,
+                response.cache_read,
+                response.cache_creation,
+            )
+
+            tool_results: list[ToolResultBlock] = []
+            for tc in response.tool_calls:
+                if event_callback:
+                    event_callback({
+                        "type": "tool_use",
+                        "toolName": tc.tool_name,
+                        "args": tc.arguments,
+                    })
+
+                result = await self._execute_tool_noninteractive(tc)
+                content = self._maybe_persist_or_truncate(tc.tool_id, result.output)
+                tool_results.append(
+                    ToolResultBlock(
+                        tool_use_id=tc.tool_id,
+                        content=content,
+                        is_error=result.is_error,
+                    )
+                )
+
+            conversation.add_tool_results_message(tool_results)
+            if self.hook_engine:
+                ctx = self._build_hook_context("turn_end")
+                await self.hook_engine.run_hooks("turn_end", ctx)
+
+        return last_text
+
+
+    async def _execute_tool_noninteractive(
+        self, tc: ToolCallComplete
+    ) -> ToolResult:
+        tool = self.registry.get_tool(tc.tool_name)
+
+        if tool is None:
+            return ToolResult(
+                output=f"Error: unknown tool '{tc.tool_name}'", is_error=True
+            )
+
+        if not self.registry.tool_is_enabled(tc.tool_name):
+            return ToolResult(
+                output=f"Error: tool '{tc.tool_name}' is disabled",
+                is_error=True,
+            )
+
+        if self.hook_engine:
+            file_path = self._infer_file_path(tc.arguments)
+            hook_ctx = self._build_hook_context(
+                "pre_tool_use",
+                tool_name=tc.tool_name,
+                tool_args=tc.arguments,
+                file_path=file_path,
+            )
+            rejection = await self.hook_engine.run_pre_tool_hooks(hook_ctx)
+            if rejection is not None:
+                return ToolResult(
+                    output=f"Hook rejected: {rejection.reason}",
+                    is_error=True,
+                )
+
+        if self.permission_validator:
+            permission_res = self.permission_validator.check(tool, tc.arguments)
+            if permission_res.permission == "deny":
+                return ToolResult(
+                    output=f"Permission denied: {permission_res.reason}",
+                    is_error=True,
+                )
+            if permission_res.permission == "query":
+                if self.permission_mode == PermissionMode.BYPASS:
+                    pass  # BYPASS 模式自动批准
+                else:
+                    return ToolResult(
+                        output="Permission denied: non-interactive agent cannot prompt user",
+                        is_error=True,
+                    )
+
+        try:
+            params = tool.params_model.model_validate(tc.arguments)
+            result = await tool.execute(params)
+        except ValidationError as e:
+            result = ToolResult(
+                output=f"Parameter validation error: {e}", is_error=True
+            )
+        except Exception as e:
+            result = ToolResult(
+                output=f"Tool execution error: {e}", is_error=True
+            )
+
+        if self.hook_engine:
+            file_path = self._infer_file_path(tc.arguments)
+            hook_ctx = self._build_hook_context(
+                "post_tool_use",
+                tool_name=tc.tool_name,
+                tool_args=tc.arguments,
+                file_path=file_path,
+            )
+            await self.hook_engine.run_hooks("post_tool_use", hook_ctx)
+
+        return result
+
+    def _infer_file_path(self, args: dict) -> str:
+        return str(args.get("file_path", args.get("path", "")))
+
+    def set_agent_catalog(self, catalog: str, catalog_list: list[tuple[str, str]] | None = None) -> None:
+        self._agent_catalog = catalog
+        if catalog_list is not None:
+            self._agent_catalog_list = catalog_list

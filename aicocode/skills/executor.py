@@ -64,7 +64,7 @@ class SkillExecutor:
             protocol=self.protocol,
             work_dir=self.agent.work_dir,
             max_iterations=self.agent.max_iterations,
-            permission_checker=None,
+            permission_validator=None,
             context_window=self.agent.context_window,
         )
 

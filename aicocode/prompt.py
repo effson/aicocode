@@ -311,6 +311,7 @@ def build_system_prompt(
     custom_instructions: str = "",
     work_dir: str = ".",
     hook_prompts: list[str] | None = None,
+    agent_catalog: list[tuple[str, str]] | None = None,
 ) -> str:
 
     builder = PromptConstructer()
@@ -340,12 +341,17 @@ def build_system_prompt(
 def build_environment_context(
     work_dir: str,
     skill_catalog: str = "",
+    agent_catalog: str = "",
 ) -> str:
     parts = [
         f"Current working directory: {work_dir}",
         f"Operating system: {platform.system()} {platform.release()}",
         f"Current time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
     ]
+
+    if agent_catalog:
+        parts.append("")
+        parts.append(agent_catalog)
 
     if skill_catalog:
         parts.append("")

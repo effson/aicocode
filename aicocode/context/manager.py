@@ -83,6 +83,12 @@ class ToolResReplacementRecord:
 def create_replacement_state() -> ToolResReplacementState:
     return ToolResReplacementState()
 
+def clone_replacement_state(src: ToolResReplacementState) -> ToolResReplacementState:
+    return ToolResReplacementState(
+        seen_ids=set(src.seen_ids),
+        replacements=dict(src.replacements),
+    )
+
 REPLACEMENT_RECORDS_FILENAME = "replacement_records.jsonl"
 
 def append_replacement_records(

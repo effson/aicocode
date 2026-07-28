@@ -101,10 +101,19 @@ from aicocode.commands.handlers import register_all_commands
 
 from aicocode.tools.install_skill import InstallSkillTool
 from aicocode.tools.load_skill import LoadSkill
+from aicocode.tools.agent_tool import AgentTool
 from aicocode.skills.executor import SkillExecutor
 from aicocode.skills.loader import SkillLoader
 from aicocode.commands.handlers.register_skill import register_skill_commands
+from aicocode.commands.handlers.tasks import create_tasks_command
+from aicocode.commands.handlers.trace import create_trace_command
 from aicocode.hooks import HookEngine, HookContext
+from aicocode.agents import(
+    AgentLoader,
+    TaskManager,
+    TraceManager,
+    inject_task_notifications,
+)
 
 import re
 
@@ -560,6 +569,8 @@ class CodeApp(App):
         sandbox_config: Any = None,
         mcp_servers: list[MCPServerConfig] | None = None,
         hook_engine: HookEngine | None = None,
+        enable_fork: bool = False,
+        enable_verification_agent: bool = False,
     ) -> None:
         super().__init__(driver_class=driver_class)
         self.providers = providers
@@ -597,6 +608,14 @@ class CodeApp(App):
         self.skill_executor: SkillExecutor | None = None
         self._load_skill_tool: LoadSkill | None = None
         self.hook_engine = hook_engine
+        self.agent_loader: AgentLoader | None = None
+        self.task_manager: TaskManager = TaskManager()
+        self.trace_manager: TraceManager = TraceManager()
+        self._enable_fork = enable_fork
+        self._enable_verification_agent = enable_verification_agent
+        self._subagent_task: asyncio.Task[None] | None = None
+        self._subagent_start_time: float | None = None
+        self._notification_check_task: asyncio.Task[None] | None = None
 
 
     @staticmethod
@@ -757,6 +776,53 @@ class CodeApp(App):
 
         install_skill_tool.set_on_installed(_on_skill_installed)
 
+        self.agent_loader = AgentLoader(
+            work_dir, enable_verification=self._enable_verification_agent
+        )
+        self.agent_loader.load_all()
+
+        agent_tool = AgentTool(
+            agent_loader=self.agent_loader,
+            task_manager=self.task_manager,
+            trace_manager=self.trace_manager,
+            parent_agent=self.agent,
+            enable_fork=self._enable_fork,
+            provider_config=provider,
+        )
+        self.registry.register_tool(agent_tool)
+
+        agent_catalog = self.agent_loader.list_agents()
+        if agent_catalog:
+            lines = [
+                "## Available Sub-Agent Types",
+                "",
+                "Use the Agent tool with subagent_type parameter to delegate tasks:",
+                "",
+            ]
+            for agent_type, when_to_use in agent_catalog:
+                lines.append(f"- **{agent_type}**: {when_to_use}")
+            if self._enable_fork:
+                lines.append("")
+                lines.append(
+                    "Leave subagent_type empty to fork the current conversation "
+                    "(inherits full dialog history)."
+                )
+            lines.append("")
+            lines.append(
+                "IMPORTANT: Sub-agents run in the background. "
+                "After calling the Agent tool, you will get a task ID immediately. "
+                "Do NOT wait, sleep, or poll for the result. "
+                "Simply report the task ID to the user and end your turn. "
+                "The system will automatically notify when the task completes."
+            )
+            self.agent.set_agent_catalog("\n".join(lines), catalog_list=agent_catalog)
+
+        tasks_cmd = create_tasks_command(self.task_manager)
+        self.command_registry.register_sync(tasks_cmd)
+
+        trace_cmd = create_trace_command(self.trace_manager, self.agent.agent_id)
+        self.command_registry.register_sync(trace_cmd)
+
         if self.hook_engine:
             asyncio.ensure_future(
                 self.hook_engine.run_hooks(
@@ -784,6 +850,10 @@ class CodeApp(App):
         chat_input.placeholder = "Send a message..."
         chat_input.load_history(work_dir)
         chat_input.focus()
+
+        self._notification_check_task = asyncio.create_task(
+            self._start_notification_polling()
+        )
 
     async def _resolve_context_window(self, provider: ProviderConfig) -> None:
         """
@@ -1332,6 +1402,7 @@ class CodeApp(App):
                 input_widget.focus()
             except Exception:
                 pass
+            await self._process_task_notifications()
 
     def _show_system_message(self, text: str) -> None:
         try:
@@ -1715,3 +1786,46 @@ class CodeApp(App):
             self.agent.set_skill_catalog("\n".join(lines))
         else:
             self.agent.set_skill_catalog("")
+
+    def action_cancel(self) -> None:
+        popup = self.query_one(CompletionPopup)
+        if popup.is_visible:
+            popup.hide()
+            self.query_one("#chat-input", ChatInput).focus()
+            return
+        if self._agent_task and not self._agent_task.done():
+            if self._subagent_task and not self._subagent_task.done():
+                task_id = self.task_manager.adopt_running(
+                    self._subagent_task, "background task"
+                ) if hasattr(self.task_manager, 'adopt_running') else None
+                if task_id:
+                    self._show_system_message(
+                        f"Task moved to background (id: {task_id})"
+                    )
+                    return
+            self._agent_task.cancel()
+
+
+    async def _process_task_notifications(self) -> None:
+        completed = self.task_manager.poll_completed()
+        if not completed or self.agent is None:
+            return
+
+        inject_task_notifications(self.conversation, completed)
+
+        for task in completed:
+            status_icon = "✓" if task.status == "completed" else "✗"
+            self._show_system_message(
+                f"{status_icon} 后台任务完成: [{task.id}] {task.name} — {task.status}"
+            )
+
+        self._agent_task = asyncio.create_task(
+            self._send_message("", is_notification=True)
+        )
+
+
+    async def _start_notification_polling(self) -> None:
+        while True:
+            await asyncio.sleep(2)
+            if not self._streaming and self.agent is not None:
+                await self._process_task_notifications()
