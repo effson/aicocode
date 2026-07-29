@@ -55,7 +55,7 @@ class AgentTool(Tool):
         parent_agent: Agent,
         enable_fork: bool = False,
         provider_config: Any = None,
-
+        worktree_manager: Any = None,
     ) -> None:
         self._agent_loader = agent_loader
         self._task_manager = task_manager
@@ -64,6 +64,7 @@ class AgentTool(Tool):
         self._enable_fork = enable_fork
         self._provider_config = provider_config
         self.query_source: str = ""
+        self._worktree_manager = worktree_manager
 
     async def execute(self, params: BaseModel) -> ToolResult:
         p: AgentToolParams = params
@@ -73,6 +74,9 @@ class AgentTool(Tool):
             defn = self._agent_loader.get(p.subagent_type)
             if defn and defn.isolation:
                 isolation = defn.isolation
+
+        if isolation == "worktree":
+            return await self._execute_with_worktree(p)
 
         from aicocode.agents.fork import ForkError, build_forked_messages
         from aicocode.agents.parser import AgentDef
@@ -238,6 +242,133 @@ class AgentTool(Tool):
         )
         self._trace_manager.complete(trace_node.agent_id, "completed")
 
+        return ToolResult(output=result_text or "(sub-agent returned no output)")
+
+
+    async def _execute_with_worktree(self, p: AgentToolParams) -> ToolResult:
+        if self._worktree_manager is None:
+            return ToolResult(
+                output="Worktree isolation is not available: WorktreeManager not configured.",
+                is_error=True,
+            )
+
+        from aicocode.agents.fork import ForkError, build_forked_messages
+        from aicocode.agents.parser import AgentDef
+        from aicocode.agents.tool_filter import clone_registry_for_fork, resolve_agent_tools
+        from aicocode.agent import Agent as AgentClass
+        from aicocode.conversation import Conversation
+        from aicocode.Permissions import (
+            DangerousCommandDetector,
+            PathSandbox,
+            PermissionValidator,
+            PermissionMode,
+            RuleEngine,
+        )
+
+        from aicocode.worktree.intergration import (
+            build_worktree_notice,
+            generate_worktree_name,
+        )
+
+        agent_def: AgentDef | None = None
+        subagent_type = p.subagent_type
+        if subagent_type:
+            agent_def = self._agent_loader.get(subagent_type)
+            if agent_def is None:
+                return ToolResult(
+                    output=f"Unknown agent type: '{subagent_type}'. "
+                           f"Available types: {', '.join(t for t, _ in self._agent_loader.list_agents())}",
+                    is_error=True,
+                )
+        else:
+            agent_def = AgentDef(
+                agent_type="worktree-agent",
+                when_to_use="Isolated worktree agent",
+                system_prompt="",
+                disallowed_tools=[],
+                model="inherit",
+                max_turns=self._parent_agent.max_iterations,
+                permission_mode="bypassPermissions",
+                source="builtin",
+            )
+
+        wt_name = generate_worktree_name()
+        try:
+            wt = await self._worktree_manager.create(wt_name, "HEAD")
+        except Exception as e:
+            return ToolResult(
+                output=f"Failed to create worktree: {e}",
+                is_error=True,
+            )
+        notice = build_worktree_notice(self._parent_agent.work_dir, wt.path)
+        task = notice + "\n\n" + p.prompt
+
+        llm_client = self._select_llm(p, agent_def)
+
+        # 构建子 agent 工具注册表
+        _base_registry = getattr(self._parent_agent, '_full_registry', None) or self._parent_agent.registry
+
+        filtered_registry = resolve_agent_tools(
+            _base_registry, agent_def, False
+        )
+
+        permission = agent_def.permission_mode
+        permission_enum = getattr(
+            PermissionMode,
+            PERMISSION_MODE_MAP.get(permission, "DEFAULT"),
+            PermissionMode.DEFAULT,
+        )
+
+        permission_validator = PermissionValidator(
+            danger_command_detector=DangerousCommandDetector(),
+            path_sandbox=PathSandbox(self._parent_agent.work_dir),
+            rule_engine=RuleEngine(),
+            permission_mode=permission_enum,
+        )
+
+        sub_agent = AgentClass(
+            client=llm_client,
+            registry=filtered_registry,
+            protocol=self._parent_agent.protocol,
+            work_dir=self._parent_agent.work_dir,
+            max_iterations=agent_def.max_turns,
+            permission_validator=permission_validator,
+            context_window=self._parent_agent.context_window,
+            instructions_content=agent_def.system_prompt,
+            hook_engine=self._parent_agent.hook_engine,
+        )
+        sub_agent.parent_id = self._parent_agent.agent_id
+        sub_agent.trace_id = self._parent_agent.trace_id or self._parent_agent.agent_id
+
+        trace_node = self._trace_manager.create(
+            agent_type=agent_def.agent_type,
+            parent_id=self._parent_agent.agent_id,
+            trace_id=sub_agent.trace_id,
+        )
+        sub_agent.agent_id = trace_node.agent_id
+
+        try:
+            result_text = await sub_agent.run_to_completion("", task)
+
+        except Exception as e:
+            self._trace_manager.complete(trace_node.agent_id, "failed")
+            return ToolResult(
+                output=f"Sub-agent in worktree failed: {e}", is_error=True
+            )
+
+        self._trace_manager.update(
+            trace_node.agent_id,
+            input_tokens=sub_agent.total_input_tokens,
+            output_tokens=sub_agent.total_output_tokens,
+        )
+        self._trace_manager.complete(trace_node.agent_id, "completed")
+
+        cleanup = await self._worktree_manager.auto_cleanup(wt_name, wt.head_commit)
+        if cleanup.kept:
+            result_text = (result_text or "") + (
+                f"\n[Worktree preserved at {cleanup.path}, branch {cleanup.branch}]"
+            )
+            
         return ToolResult(output=result_text or "(sub-agent returned no output)")
 
     def _select_llm(

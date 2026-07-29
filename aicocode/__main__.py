@@ -62,5 +62,6 @@ def main() -> None:
         hook_engine=hook_engine,
         enable_fork=config.enable_fork,
         enable_verification_agent=config.enable_verification_agent,
+        worktree_config=config.worktree,
     )
     app.run()

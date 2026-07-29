@@ -124,6 +124,12 @@ class SandboxAppConfig:
 
 
 @dataclass
+class WorkTreeConfig:
+    symlink_directories: list[str] = field(default_factory=lambda: ["node_modules", ".venv", "vendor"])
+    stale_cleanup_interval: int = 3600
+    stale_cutoff_hours: int = 24
+
+@dataclass
 class AppConfig:
     """
         应用配置：providers 列表 + 初始选定供应商名。
@@ -135,6 +141,7 @@ class AppConfig:
     raw_hooks: list[dict] = field(default_factory=list)
     enable_fork: bool = False
     enable_verification_agent: bool = False
+    worktree: WorkTreeConfig = field(default_factory=WorkTreeConfig)
 
 def _load_config_yaml(path: Path) -> AppConfig:
     try:
@@ -177,6 +184,13 @@ def _load_config_yaml(path: Path) -> AppConfig:
         network_enabled=sb["network_enabled"],
     )
 
+    wt = validated_config["worktree"]
+    worktree_cfg = WorkTreeConfig(
+        symlink_directories=wt["symlink_directories"],
+        stale_cleanup_interval=wt["stale_cleanup_interval"],
+        stale_cutoff_hours=wt["stale_cutoff_hours"],
+    )
+
     return AppConfig(
         providers=providers,
         permission_mode=validated_config["permission_mode"],
@@ -185,6 +199,7 @@ def _load_config_yaml(path: Path) -> AppConfig:
         raw_hooks=validated_config["hooks"],
         enable_fork=validated_config["enable_fork"],
         enable_verification_agent=validated_config["enable_verification_agent"],
+        worktree=worktree_cfg,
     )
 
 def _merge_existing_config(base: AppConfig, override: AppConfig) -> AppConfig:

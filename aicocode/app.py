@@ -98,6 +98,7 @@ from aicocode.commands import (
     parse_command,
 )
 from aicocode.commands.handlers import register_all_commands
+from aicocode.commands.handlers.worktree import create_worktree_command
 
 from aicocode.tools.install_skill import InstallSkillTool
 from aicocode.tools.load_skill import LoadSkill
@@ -114,6 +115,8 @@ from aicocode.agents import(
     TraceManager,
     inject_task_notifications,
 )
+from aicocode.worktree.manager import WorktreeManager
+from aicocode.worktree.cleanup import start_stale_cleanup_task
 
 import re
 
@@ -571,6 +574,7 @@ class CodeApp(App):
         hook_engine: HookEngine | None = None,
         enable_fork: bool = False,
         enable_verification_agent: bool = False,
+        worktree_config: Any = None,
     ) -> None:
         super().__init__(driver_class=driver_class)
         self.providers = providers
@@ -616,6 +620,9 @@ class CodeApp(App):
         self._subagent_task: asyncio.Task[None] | None = None
         self._subagent_start_time: float | None = None
         self._notification_check_task: asyncio.Task[None] | None = None
+        self._worktree_config = worktree_config
+        self.worktree_manager: WorktreeManager | None = None
+        self._stale_cleanup_task: asyncio.Task[None] | None = None
 
 
     @staticmethod
@@ -776,6 +783,33 @@ class CodeApp(App):
 
         install_skill_tool.set_on_installed(_on_skill_installed)
 
+        from aicocode.config import WorkTreeConfig
+        wt_cfg = self._worktree_config or WorkTreeConfig()
+        self.worktree_manager = WorktreeManager(
+            repo_root=work_dir,
+            symlink_directories=wt_cfg.symlink_directories,
+        )
+
+        restored = self.worktree_manager.restore_session()
+        if restored:
+            self.agent.work_dir = restored.worktree_path
+
+        wt_command = create_worktree_command(self.worktree_manager)
+        self.command_registry.register_sync(wt_command)
+
+        from aicocode.tools.enter_worktree import EnterWorktreeTool
+        from aicocode.tools.exit_worktree import ExitWorktreeTool
+        self.registry.register_tool(EnterWorktreeTool(worktree_manager=self.worktree_manager))
+        self.registry.register_tool(ExitWorktreeTool(worktree_manager=self.worktree_manager))
+
+        self._stale_cleanup_task = asyncio.create_task(
+            start_stale_cleanup_task(
+                self.worktree_manager,
+                wt_cfg.stale_cleanup_interval,
+                wt_cfg.stale_cutoff_hours,
+            )
+        )
+
         self.agent_loader = AgentLoader(
             work_dir, enable_verification=self._enable_verification_agent
         )
@@ -788,6 +822,7 @@ class CodeApp(App):
             parent_agent=self.agent,
             enable_fork=self._enable_fork,
             provider_config=provider,
+            worktree_manager=self.worktree_manager,
         )
         self.registry.register_tool(agent_tool)
 
@@ -990,7 +1025,10 @@ class CodeApp(App):
                 for t in tasks:
                     if not t.done():
                         t.cancel()
-            
+
+            if self._stale_cleanup_task and not self._stale_cleanup_task.done():
+                self._stale_cleanup_task.cancel()
+
             if self.session:
                 self.session.close()
             

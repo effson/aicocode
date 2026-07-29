@@ -159,6 +159,38 @@ def validate_bool_field(value: object, field_name: str) -> bool:
         raise ConfigError(f"'{field_name}' must be a boolean")
     return value
 
+def validate_worktree(raw_wt: dict | None) -> dict:
+    """校验 worktree 配置段，返回清洗后的配置字典。"""
+    defaults = {
+        "symlink_directories": ["node_modules", ".venv", "vendor"],
+        "stale_cleanup_interval": 3600,
+        "stale_cutoff_hours": 24,
+    }
+
+    if raw_wt is None:
+        return defaults
+
+    if not isinstance(raw_wt, dict):
+        raise ConfigError("'worktree' must be a mapping")
+
+    sym = raw_wt.get("symlink_directories", defaults["symlink_directories"])
+    if not isinstance(sym, list) or not all(isinstance(s, str) for s in sym):
+        raise ConfigError("'worktree.symlink_directories' must be a list of strings")
+
+    interval = raw_wt.get("stale_cleanup_interval", defaults["stale_cleanup_interval"])
+    if not isinstance(interval, int) or interval <= 0:
+        raise ConfigError("'worktree.stale_cleanup_interval' must be a positive integer")
+
+    cutoff = raw_wt.get("stale_cutoff_hours", defaults["stale_cutoff_hours"])
+    if not isinstance(cutoff, int) or cutoff <= 0:
+        raise ConfigError("'worktree.stale_cutoff_hours' must be a positive integer")
+
+    return {
+        "symlink_directories": sym,
+        "stale_cleanup_interval": interval,
+        "stale_cutoff_hours": cutoff,
+    }
+
 """
     模型配置
 """
@@ -214,4 +246,5 @@ def validate_config(raw: object) -> dict:
             raw.get("enable_verification_agent", False), "enable_verification_agent"
         ),
         "enable_fork": validate_bool_field(raw.get("enable_fork", False), "enable_fork"),
+        "worktree": validate_worktree(raw.get("worktree")),
     }
