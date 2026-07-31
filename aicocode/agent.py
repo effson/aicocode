@@ -139,12 +139,23 @@ class Agent:
         self.trace_id: str | None = None
         self._agent_catalog: str = ""
         self._agent_catalog_list: list[tuple[str, str]] = []
+        self._team_manager: Any = None
+        self.enable_coordinator_mode: bool = False
+        self.team_name: str = ""
+        self.notification_fn: Callable[[], list[str]] | None = None
 
     @property
     def _transcript_path(self) -> str:
         if self.session_id:
             return str(Path(self.work_dir) / ".aicocode" / "sessions" / f"{self.session_id}.jsonl")
         return ""
+
+    @property
+    def coordinator_mode(self) -> bool:
+        """
+        coordinator 模式是，只取决于配置
+        """
+        return self.enable_coordinator_mode
 
     async def _execute_single_tool_direct(
         self, tc: ToolCallComplete
@@ -443,6 +454,11 @@ class Agent:
                 for hook_event in self._drain_hook_events():
                     yield hook_event
 
+            self._consume_mailbox(conversation)
+            if self.notification_fn:
+                for note in self.notification_fn():
+                    conversation.add_system_reminder(note)
+
             hook_prompts = (
                 self.hook_engine.get_prompt_messages() if self.hook_engine else None
             )
@@ -461,6 +477,16 @@ class Agent:
                     plan_file_path, plan_file_exists, iteration
                 )
                 conversation.add_system_reminder(plan_reminder)
+
+            if self.coordinator_mode:
+                from aicocode.teams.coordinator import get_coordinator_reminder
+
+                conversation.add_system_reminder(
+                    get_coordinator_reminder(
+                        iteration,
+                        agent_catalog=self._agent_catalog_list or None,
+                    )
+                )
 
             if self.hook_engine:
                 for note in self.hook_engine.drain_notifications():
@@ -889,9 +915,10 @@ class Agent:
                 ctx = self._build_hook_context("turn_start")
                 await self.hook_engine.run_hooks("turn_start", ctx)
 
-            pre_compact_records = apply_tool_result_budget(
-                conversation, self.session_dir, self.replacement_state
-            )
+            self._consume_mailbox(conversation)
+            if self.notification_fn:
+                for note in self.notification_fn():
+                    conversation.add_system_reminder(note)
 
             compact_result = await auto_compact(
                 conversation=conversation,
@@ -1083,3 +1110,21 @@ class Agent:
         self._agent_catalog = catalog
         if catalog_list is not None:
             self._agent_catalog_list = catalog_list
+
+    def _consume_mailbox(self, conversation: Conversation) -> None:
+        if not self.team_name or not self._team_manager:
+            return
+
+        try:
+            mailbox = self._team_manager.get_mailbox(self.team_name)
+            if mailbox is None:
+                return
+            messages = mailbox.consume(self.agent_id)
+            for msg in messages:
+                prefix = f"[Message from {msg.from_agent}]"
+                if msg.type != "text":
+                    prefix = f"[{msg.type} from {msg.from_agent}]"
+                content = f"{prefix} {msg.text}"
+                conversation.add_user_message(content)
+        except Exception as e:
+            log.debug("Mailbox consumption failed: %s", e)

@@ -142,6 +142,8 @@ class AppConfig:
     enable_fork: bool = False
     enable_verification_agent: bool = False
     worktree: WorkTreeConfig = field(default_factory=WorkTreeConfig)
+    teammate_mode: str = ""
+    enable_coordinator_mode: bool = False
 
 def _load_config_yaml(path: Path) -> AppConfig:
     try:
@@ -200,6 +202,8 @@ def _load_config_yaml(path: Path) -> AppConfig:
         enable_fork=validated_config["enable_fork"],
         enable_verification_agent=validated_config["enable_verification_agent"],
         worktree=worktree_cfg,
+        teammate_mode=validated_config["teammate_mode"],
+        enable_coordinator_mode=validated_config["enable_coordinator_mode"],
     )
 
 def _merge_existing_config(base: AppConfig, override: AppConfig) -> AppConfig:
@@ -226,6 +230,10 @@ def _merge_existing_config(base: AppConfig, override: AppConfig) -> AppConfig:
         base.enable_fork = True
     if override.enable_verification_agent:
         base.enable_verification_agent = True
+    if override.teammate_mode:
+        base.teammate_mode = override.teammate_mode
+    if override.enable_coordinator_mode:
+        base.enable_coordinator_mode = True
     return base
 
 

@@ -7,6 +7,9 @@ from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, Field
 from aicocode.tools.tool_base import Tool, ToolResult
+if TYPE_CHECKING:
+    from aicocode.sandbox import Sandbox, SandboxConfig
+
 
 MAX_BASH_TIMEOUT = 600
 
@@ -105,13 +108,17 @@ class Bash(Tool):
     # 工作目录，为 None 时使用当前进程的工作目录
     work_dir: str | None = None
 
-    # OS 级沙箱暂时不实现
+    # OS 级沙箱
+    sandbox: Sandbox | None = None
+    sandbox_config: SandboxConfig | None = None
 
     async def execute(self, params: Params) -> ToolResult:
         timeout = min(params.timeout, MAX_BASH_TIMEOUT)
 
         # OS 沙箱暂时不实现
         actual_command = params.command
+        if self.sandbox and self.sandbox_config and self.sandbox.available():
+            actual_command = self.sandbox.wrap(params.command, self.sandbox_config)
 
         try:
             proc = await asyncio.create_subprocess_shell(

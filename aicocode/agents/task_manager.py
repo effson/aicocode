@@ -7,6 +7,8 @@ import uuid
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable
 
+from aicocode.teams.manager import TeamManager
+
 if TYPE_CHECKING:
     from aicocode.agent import Agent
 
@@ -47,6 +49,7 @@ class TaskManager:
         task: str,
         name: str = "",
         fork_conversation: Any = None,
+        lead_agent_id: str = "lead",
     ) -> str:
         task_id = uuid.uuid4().hex[:8]
         bg = BackgroundTask(
@@ -58,7 +61,7 @@ class TaskManager:
         self._tasks[task_id] = bg
 
         async_task = asyncio.create_task(
-            self._run_background(task_id, fork_conversation)
+            self._run_background(task_id, fork_conversation, lead_agent_id)
         )
         self._async_tasks[task_id] = async_task
 
@@ -66,7 +69,9 @@ class TaskManager:
         return task_id
 
     async def _run_background(
-        self, task_id: str, fork_conversation: Any = None
+        self, task_id: str,
+        fork_conversation: Any = None,
+        lead_agent_id: str = "lead",
     ) -> None:
         bg = self._tasks.get(task_id)
         if bg is None:
@@ -79,6 +84,33 @@ class TaskManager:
                 result = await bg.agent.run_to_completion(bg.task)
             bg.result = result
             bg.status = "completed"
+
+            if bg.agent.team_name and bg.agent._team_manager:
+                mailbox = bg.agent._team_manager.get_mailbox(bg.agent.team_name)
+                if mailbox:
+                    from aicocode.teams.mailbox import create_message
+                    msg = create_message(
+                        from_agent=bg.name,
+                        text=f"[idle] {bg.name} (reason: available)",
+                    )
+                    mailbox.write(lead_agent_id, msg)
+                    log.info(f"[{bg.name} is idle(available)] send to lead")
+
+                    for _ in range(60):
+                        await asyncio.sleep(1)
+                        msgs = mailbox.consume(bg.agent.agent_id)
+                        if not msgs:
+                            continue
+                        prompt = "\n\n".join(
+                            f"[Message from {m.from_agent}] {m.text}" for m in msgs
+                        )
+                        result = await bg.agent.run_to_completion(prompt)
+                        bg.result = result
+                        msg = create_message(
+                            from_agent=bg.name,
+                            text=f"[idle] {bg.name} (reason: available)",
+                        )
+                        mailbox.write(lead_agent_id, msg)
         except asyncio.CancelledError:
             bg.status = "cancelled"
             bg.result = "Task was cancelled"

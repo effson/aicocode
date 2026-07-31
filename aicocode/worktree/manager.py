@@ -17,6 +17,7 @@ from aicocode.worktree.changes import (
 from aicocode.worktree.models import Worktree, WorktreeSession
 from aicocode.worktree.session import load_worktree_session, save_worktree_session
 from aicocode.worktree.slug import flatten_slug, validate_slug
+from aicocode.worktree.setup import perform_post_creation_setup
 
 log = logging.getLogger(__name__)
 

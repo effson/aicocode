@@ -117,6 +117,7 @@ from aicocode.agents import(
 )
 from aicocode.worktree.manager import WorktreeManager
 from aicocode.worktree.cleanup import start_stale_cleanup_task
+from aicocode.teammate_tree import TeammateTree
 
 import re
 
@@ -575,6 +576,8 @@ class CodeApp(App):
         enable_fork: bool = False,
         enable_verification_agent: bool = False,
         worktree_config: Any = None,
+        enable_coordinator_mode: bool = False,
+        teammate_mode: str = "",
     ) -> None:
         super().__init__(driver_class=driver_class)
         self.providers = providers
@@ -623,7 +626,10 @@ class CodeApp(App):
         self._worktree_config = worktree_config
         self.worktree_manager: WorktreeManager | None = None
         self._stale_cleanup_task: asyncio.Task[None] | None = None
-
+        self._enable_coordinator_mode = enable_coordinator_mode
+        self._teammate_mode = teammate_mode
+        self._teammate_tree: TeammateTree | None = None
+        self._teammate_timer = None
 
     @staticmethod
     def _make_banner(model: str = "", work_dir: str = "") -> RichText:
@@ -692,6 +698,24 @@ class CodeApp(App):
             permission_mode=self._initial_permission_mode,
             os_sandbox_enabled=sandbox_auto_allow,
         )
+
+        # 如果配置启用了沙箱，为 Bash 工具挂载 OS 沙箱
+        if self._sandbox_cfg.enabled:
+            from aicocode.sandbox import SandboxConfig, create_sandbox
+            os_sandbox = create_sandbox()
+            if os_sandbox and os_sandbox.available():
+                sandbox_config = SandboxConfig(
+                    allow_write=[work_dir, "/tmp"],
+                    deny_write=[
+                        f"{work_dir}/.aicocode/config.yaml",
+                        f"{work_dir}/.aicocode/permissions.local.yaml",
+                    ],
+                    network_enabled=self._sandbox_cfg.network_enabled,
+                )
+                bash_tool = self.registry.get("Bash")
+                if bash_tool:
+                    bash_tool.sandbox = os_sandbox
+                    bash_tool.sandbox_config = sandbox_config
 
         self._instructions_content = load_instructions(work_dir)
         self.memory_manager = MemoryManager(work_dir)
@@ -815,6 +839,12 @@ class CodeApp(App):
         )
         self.agent_loader.load_all()
 
+        from aicocode.teams.manager import TeamManager
+        from aicocode.tools.team_create import TeamCreateTool
+        from aicocode.tools.team_delete import TeamDeleteTool
+
+        self.team_manager = TeamManager(worktree_manager=self.worktree_manager, trace_manager=self.trace_manager)
+
         agent_tool = AgentTool(
             agent_loader=self.agent_loader,
             task_manager=self.task_manager,
@@ -823,8 +853,24 @@ class CodeApp(App):
             enable_fork=self._enable_fork,
             provider_config=provider,
             worktree_manager=self.worktree_manager,
+            team_manager=self.team_manager,
         )
         self.registry.register_tool(agent_tool)
+
+        team_create_tool = TeamCreateTool(
+            team_manager=self.team_manager,
+            parent_agent=self.agent,
+            teammate_mode=self._teammate_mode,
+            is_interactive=True,
+            enable_coordinator_mode=self._enable_coordinator_mode,
+        )
+        self.registry.register_tool(team_create_tool)
+
+        team_delete_tool = TeamDeleteTool(
+            team_manager=self.team_manager,
+            parent_agent=self.agent,
+        )
+        self.registry.register_tool(team_delete_tool)
 
         agent_catalog = self.agent_loader.list_agents()
         if agent_catalog:
@@ -857,6 +903,18 @@ class CodeApp(App):
 
         trace_cmd = create_trace_command(self.trace_manager, self.agent.agent_id)
         self.command_registry.register_sync(trace_cmd)
+
+        from aicocode.tools.synthetic_output import SyntheticOutputTool
+        from aicocode.tools.task_stop import TaskStopTool
+        self.registry.register_tool(SyntheticOutputTool())
+        self.registry.register_tool(TaskStopTool(team_manager=self.team_manager))
+
+        if self._enable_coordinator_mode:
+            from aicocode.agents.tool_filter import apply_coordinator_filter
+
+            self.agent.enable_coordinator_mode = True
+            self.agent.registry = apply_coordinator_filter(self.agent.registry)
+        self.agent._team_manager = self.team_manager
 
         if self.hook_engine:
             asyncio.ensure_future(
@@ -1028,6 +1086,16 @@ class CodeApp(App):
 
             if self._stale_cleanup_task and not self._stale_cleanup_task.done():
                 self._stale_cleanup_task.cancel()
+
+            if hasattr(self, 'team_manager'):
+                for name in list(self.team_manager._teams):
+                    try:
+                        team = self.team_manager._teams[name]
+                        for m in team.members:
+                            team.set_member_active(m.name, False)
+                        self.team_manager.delete_team(name)
+                    except Exception:
+                        pass
 
             if self.session:
                 self.session.close()
@@ -1265,6 +1333,11 @@ class CodeApp(App):
         )
         await chat.mount(self._spinner_label)
 
+        self._teammate_tree = TeammateTree(id="teammate-tree")
+        self._teammate_tree.display = False
+        await chat.mount(self._teammate_tree)
+        self._start_teammate_polling()
+
         self.call_after_refresh(chat.scroll_end, animate=False)
         self._start_spinner()
 
@@ -1483,7 +1556,11 @@ class CodeApp(App):
     def _finish_streaming(self) -> None:
         self._streaming = False
         self._stop_spinner()
+        self._stop_teammate_polling()
         self._agent_task = None
+        if self._teammate_tree is not None:
+            self._teammate_tree.remove()
+            self._teammate_tree = None
         if self._spinner_label is not None:
             try:
                 self._spinner_label.remove()
@@ -1856,14 +1933,84 @@ class CodeApp(App):
             self._show_system_message(
                 f"{status_icon} 后台任务完成: [{task.id}] {task.name} — {task.status}"
             )
+            
+            if hasattr(self, 'team_manager'):
+                self.team_manager.on_teammate_completed(task.agent.agent_id)
 
         self._agent_task = asyncio.create_task(
             self._send_message("", is_notification=True)
         )
 
+    async def _process_mailbox_notifications(self) -> None:
+        if not hasattr(self, "team_manager") or self.team_manager is None:
+            return
+
+        if self._streaming or self.agent is None:
+            return
+        
+        notes = self.team_manager.drain_lead_mailbox()
+        if not notes:
+            return
+        for note in notes:
+            self.conversation.add_system_reminder(note)
+        self._agent_task = asyncio.create_task(
+            self._send_message("", is_notification=True)
+        )
 
     async def _start_notification_polling(self) -> None:
         while True:
             await asyncio.sleep(2)
             if not self._streaming and self.agent is not None:
                 await self._process_task_notifications()
+                await self._process_mailbox_notifications()
+
+    def _start_teammate_polling(self) -> None:
+        """Start polling teammate progress every 0.5s."""
+        if self._teammate_timer is not None:
+            return
+        self._teammate_timer = self.set_interval(0.5, self._tick_teammate_tree)
+
+
+    def _stop_teammate_polling(self) -> None:
+        """Stop the teammate progress polling timer."""
+        if self._teammate_timer is not None:
+            self._teammate_timer.stop()
+            self._teammate_timer = None
+
+    def _tick_teammate_tree(self) -> None:
+        """Poll team_manager for teammate progress and update the tree widget."""
+        if not hasattr(self, "team_manager") or self.team_manager is None:
+            return
+        if self._teammate_tree is None:
+            return
+
+        progress_list = self.team_manager.get_all_teammate_progress()
+
+        if not progress_list:
+            self._teammate_tree.display = False
+            self._update_teammates_label(0)
+            return
+
+        # Update the reactive properties via mutate_reactive for list
+        self._teammate_tree.teammates = list(progress_list)
+
+        # Update leader tokens from main agent
+        if self.agent:
+            self._teammate_tree.leader_tokens = (
+                self.agent.total_input_tokens + self.agent.total_output_tokens
+            )
+
+        self._teammate_tree.display = True
+        active_count = sum(1 for p in progress_list if p.status == "running")
+        self._update_teammates_label(active_count)
+
+    def _update_teammates_label(self, count: int) -> None:
+        """Update the teammates count in the status bar."""
+        try:
+            label = self.query_one("#teammates-label", Static)
+            if count > 0:
+                label.update(f"[cyan]● {count} teammate{'s' if count != 1 else ''}[/cyan]  ")
+            else:
+                label.update("")
+        except Exception:
+            pass

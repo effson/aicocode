@@ -80,6 +80,8 @@ COORDINATOR_MODE_ALLOWED_TOOLS: frozenset[str] = frozenset({
     "Bash",
 })
 
+TEAMMATE_DISALLOWED_TOOLS: frozenset[str] = frozenset({"TeamCreate", "TeamDelete"})
+
 def _is_mcp_tool(name: str) -> bool:
     return name.startswith("mcp__")
 
@@ -150,3 +152,74 @@ def clone_registry_for_fork(parent_registry: ToolRegistry) -> ToolRegistry:
         else:
             forked.register_tool(tool)
     return forked
+
+def build_teammate_tools(
+    parent_registry: ToolRegistry,
+    team_manager: TeamManager,
+    team_name: str,
+    agent_id: str,
+    agent_name: str,
+    backend_type: str,
+    definition: AgentDef | None = None,
+) -> ToolRegistry:
+    from aicocode.teams.models import BackendType
+    from aicocode.tools.send_message import SendMessageTool
+    from aicocode.tools.task_create import TaskCreateTool
+    from aicocode.tools.task_get import TaskGetTool
+    from aicocode.tools.task_list import TaskListTool
+    from aicocode.tools.task_update import TaskUpdateTool
+
+    if backend_type == BackendType.IN_PROCESS.value:
+        all_tools = {t.name: t for t in parent_registry.list_tools()}
+        filtered = {
+            name: tool
+            for name, tool in all_tools.items()
+            if name in IN_PROCESS_TEAMMATE_ALLOWED_TOOLS
+        }
+    else:
+        # 窗格队友整份继承，再挡掉两类：任何子 Agent 都不该有的，以及团队成员管理工具
+        filtered = {
+            name: tool
+            for name, tool in ((t.name, t) for t in parent_registry.list_tools())
+            if name not in ALL_AGENT_DISALLOWED_TOOLS
+            and name not in TEAMMATE_DISALLOWED_TOOLS
+        }
+
+    # 应用 agent 定义中的工具限制
+    if definition is not None:
+        if definition.disallowed_tools:
+            for name in definition.disallowed_tools:
+                filtered.pop(name, None)
+        if definition.tools:
+            allowed_set = set(definition.tools) | TEAMMATE_COORDINATION_TOOLS
+            filtered = {
+                name: tool
+                for name, tool in filtered.items()
+                if name in allowed_set
+            }
+
+    coordination_tools = [
+        TaskCreateTool(team_manager, team_name, agent_name),
+        TaskGetTool(team_manager, team_name),
+        TaskListTool(team_manager, team_name),
+        TaskUpdateTool(team_manager, team_name),
+        SendMessageTool(team_manager, team_name, agent_id, agent_name),
+    ]
+
+    registry = ToolRegistry()
+    for tool in filtered.values():
+        registry.register_tool(tool)
+    for tool in coordination_tools:
+        registry.register_tool(tool)
+
+    return registry
+
+def apply_coordinator_filter(registry: ToolRegistry) -> ToolRegistry:
+    # MCP 工具同样不放行：抓网页、查数据库这类返回值动辄几千 token，
+    # 灌进 Lead 的上下文和让它自己读文件是一个性质，要用就派队员去用。
+    all_tools = {t.name: t for t in registry.list_tools()}
+    filtered = ToolRegistry()
+    for name, tool in all_tools.items():
+        if name in COORDINATOR_MODE_ALLOWED_TOOLS:
+            filtered.register(tool)
+    return filtered

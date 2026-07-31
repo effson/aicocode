@@ -11,6 +11,7 @@ from aicocode.commands.handlers.session import SESSION_COMMAND
 from aicocode.commands.handlers.rewind import REWIND_COMMAND
 from aicocode.commands.handlers.status import STATUS_COMMAND
 from aicocode.commands.handlers.skill import SKILL_COMMAND
+from aicocode.commands.handlers.sandbox import SANDBOX_COMMAND
 from aicocode.commands.registry import CommandRegistry
 
 
@@ -26,6 +27,7 @@ ALL_COMMANDS = [
     REWIND_COMMAND,
     STATUS_COMMAND,
     SKILL_COMMAND,
+    SANDBOX_COMMAND,
 ]
 
 

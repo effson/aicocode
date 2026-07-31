@@ -18,6 +18,8 @@ VALID_PERMISSION_MODES = {
     "bypassPermissions",
 }
 
+VALID_TEAMMATE_MODES = {"", "in-process"}
+
 class ConfigError(Exception):
     pass
 
@@ -191,6 +193,15 @@ def validate_worktree(raw_wt: dict | None) -> dict:
         "stale_cutoff_hours": cutoff,
     }
 
+def validate_teammate_mode(mode: object) -> str:
+    """校验 teammate_mode 取值。"""
+    if not isinstance(mode, str) or mode not in VALID_TEAMMATE_MODES:
+        raise ConfigError(
+            f"Invalid teammate_mode '{mode}', "
+            f"must be one of: {', '.join(repr(m) for m in sorted(VALID_TEAMMATE_MODES))}"
+        )
+    return mode
+
 """
     模型配置
 """
@@ -247,4 +258,8 @@ def validate_config(raw: object) -> dict:
         ),
         "enable_fork": validate_bool_field(raw.get("enable_fork", False), "enable_fork"),
         "worktree": validate_worktree(raw.get("worktree")),
+        "teammate_mode": validate_teammate_mode(raw.get("teammate_mode", "")),
+        "enable_coordinator_mode": validate_bool_field(
+            raw.get("enable_coordinator_mode", False), "enable_coordinator_mode"
+        ),
     }
