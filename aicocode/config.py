@@ -263,7 +263,7 @@ def load_config(path: Path | None = None) -> AppConfig:
 
     if merged_cfg is None:
         raise ConfigError(
-            "No config file found. Expected .mewcode/config.yaml "
-            "in project or ~/.mewcode/config.yaml"
+            "No config file found. Expected .aicocode/config.yaml "
+            "in project or ~/.aicocode/config.yaml"
         )
     return merged_cfg

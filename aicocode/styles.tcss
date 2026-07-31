@@ -224,3 +224,35 @@ AskUserDialog {
 #askuser-content {
     padding: 0 0;
 }
+
+/* --- Inline Resume Widget --- */
+
+#resume-inline {
+    height: auto;
+    padding: 0 0;
+}
+
+#resume-content {
+    padding: 0 0;
+}
+
+/* --- Teammate Tree --- */
+
+#teammate-tree {
+    height: auto;
+    padding: 0 2;
+}
+
+/* --- Thinking Display --- */
+
+.thinking-done {
+    color: $text-muted;
+    text-style: italic;
+}
+
+/* --- Sub-Agent Block --- */
+
+.subagent-block {
+    color: $text;
+    padding: 0 2;
+}

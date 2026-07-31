@@ -8,8 +8,8 @@ from pydantic import BaseModel, Field
 from aicocode.tools.tool_base import Tool, ToolResult
 
 if TYPE_CHECKING:
-    from mewcode.cache import FileCache
-    from mewcode.tools.file_state_cache import FileStateCache
+    from aicocode.file_cache import FileCache
+    from aicocode.tools.file_state_cache import FileStateCache
 
 
 class Params(BaseModel):

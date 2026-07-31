@@ -642,15 +642,15 @@ class AgentTool(Tool):
         self, p: Any, team: Any, member: Any, backend: Any, wt: Any,
         agent_id: str, teammate_name: str,
     ) -> ToolResult:
-        from mewcode.teams.models import BackendType
-        from mewcode.teams.spawn import build_teammate_cli
+        from aicocode.teams.models import BackendType
+        from aicocode.teams.spawn import build_teammate_cli
 
         # 外部进程通过邮箱领取初始任务：spawn 前先把任务投进队友邮箱（按队友名字为键），
         # 新进程启动后第一次空闲轮询就能看到工作。
         mailbox = self._team_manager.get_mailbox(p.team_name)
         if mailbox is not None and p.prompt:
-            from mewcode.teams.mailbox import create_message
-            from mewcode.teams.spawn_inprocess import LEAD_NAME
+            from aicocode.teams.mailbox import create_message
+            from aicocode.teams.spawn_inprocess import LEAD_NAME
             mailbox.write(
                 teammate_name,
                 create_message(
@@ -659,12 +659,12 @@ class AgentTool(Tool):
                 ),
             )
 
-        # 构造把本 mewcode 拉起为队友 worker 模式的命令，cd 到该队友的 worktree
+        # 构造把本 aicocode 拉起为队友 worker 模式的命令，cd 到该队友的 worktree
         cli_command = build_teammate_cli(p.team_name, teammate_name, wt.path)
 
         try:
             if backend == BackendType.TMUX:
-                from mewcode.teams.spawn_tmux import spawn_tmux_teammate
+                from aicocode.teams.spawn_tmux import spawn_tmux_teammate
                 pane_info = spawn_tmux_teammate(
                     team_name=p.team_name,
                     member_name=teammate_name,
@@ -672,7 +672,7 @@ class AgentTool(Tool):
                 )
                 self._team_manager.register_pane_id(agent_id, pane_info.pane_id)
             elif backend == BackendType.ITERM2:
-                from mewcode.teams.spawn_iterm2 import spawn_iterm2_teammate
+                from aicocode.teams.spawn_iterm2 import spawn_iterm2_teammate
                 pane_info = spawn_iterm2_teammate(
                     team_name=p.team_name,
                     member_name=teammate_name,

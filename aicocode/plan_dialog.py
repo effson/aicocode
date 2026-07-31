@@ -18,7 +18,7 @@ class PlanChoice(str, Enum):
 _OPTIONS = [
     ("Yes, enter YOLO mode (auto-approve all)", PlanChoice.YOLO),
     ("Yes, manually approve edits", PlanChoice.MANUAL),
-    ("Tell MewCode what to change", PlanChoice.FEEDBACK),
+    ("Tell AicoCode what to change", PlanChoice.FEEDBACK),
 ]
 
 
