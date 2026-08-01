@@ -72,20 +72,31 @@ class MCPTool(Tool):
         self.category = "command"
         self.is_concurrency_safe = False
         self.should_defer = True
+        input_schema = getattr(
+            tool_def, "input_schema", getattr(tool_def, "inputSchema", {})
+        )
         self.params_model = _build_params_model(
-            tool_def.name, tool_def.inputSchema
+            tool_def.name, input_schema
         )
 
     @property
     def mcp_tool_name(self) -> str:
         return self._tool_def.name
 
+    @property
+    def _input_schema(self) -> dict[str, Any]:
+        """获取兼容新旧 mcp SDK 的 input schema"""
+        return getattr(
+            self._tool_def,
+            "input_schema",
+            getattr(self._tool_def, "inputSchema", {})
+        )
 
     def get_schema(self) -> dict[str, Any]:
         return {
             "name": self.name,
             "description": self.description,
-            "input_schema": self._tool_def.inputSchema,
+            "input_schema": self._input_schema,
         }
 
 
