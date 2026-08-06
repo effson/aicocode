@@ -368,7 +368,7 @@ class AgentTool(Tool):
             client=llm_client,
             registry=filtered_registry,
             protocol=self._parent_agent.protocol,
-            work_dir=self._parent_agent.work_dir,
+            work_dir=wt.path,
             max_iterations=agent_def.max_turns,
             permission_validator=permission_validator,
             context_window=self._parent_agent.context_window,
